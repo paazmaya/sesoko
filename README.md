@@ -11,7 +11,8 @@ uv sync
 # Run captioning on a folder
 uv run python caption_images.py "path/to/images"
 
-# Output will be saved to captions.toml
+# Output will be saved to captions.toml in the current folder
+# and for each image as sidecar text files under "path/to/images"
 ```
 
 ## Current Model
@@ -28,9 +29,9 @@ uv run python caption_images.py "path/to/images"
 ## Features
 
 - ✅ Streams captions to TOML file in real-time
+- ✅ Creates sidecar `.txt` files alongside images (by default)
 - ✅ Aspect-ratio preserving image resizing (896x896 max)
 - ✅ Plain English descriptions without formatting
-- ✅ Flash Attention 2 for optimized inference
 - ✅ Graceful error handling with per-image try-catch
 - ✅ Progress tracking with image count
 
@@ -66,7 +67,7 @@ Captions are generated with these parameters:
 
 ### Output Format
 
-Captions are saved to TOML format, organized by folder absolute path:
+**TOML File** - Captions are saved to TOML format, organized by folder absolute path:
 ```toml
 ["/absolute/path/to/images/folder"]
 "image1.jpg" = "Caption text here..."
@@ -76,7 +77,16 @@ Captions are saved to TOML format, organized by folder absolute path:
 "photo.jpg" = "Different folder caption..."
 ```
 
-Streaming writes mean captions are saved after each image is processed. The absolute path of the input folder is used as the section name, allowing you to organize captions from multiple folders in one TOML file.
+**Sidecar Files** - By default, `.txt` files are created alongside each image:
+```
+images/
+  photo1.jpg
+  photo1.jpg.txt     # Contains the caption for photo1.jpg
+  photo2.jpg
+  photo2.jpg.txt     # Contains the caption for photo2.jpg
+```
+
+Streaming writes mean captions are saved after each image is processed. The absolute path of the input folder is used as the section name in the TOML file, allowing you to organize captions from multiple folders in one file.
 
 ## Supported Image Formats
 
@@ -91,7 +101,7 @@ Streaming writes mean captions are saved after each image is processed. The abso
 ## Requirements
 
 - Python 3.11+
-- CUDA-capable GPU (12GB VRAM recommended)
+- CUDA-capable GPU (Nvidia that is)
 - ~4-6 GB VRAM for 2B model
 - ~6-8 GB VRAM for 4B model
 
@@ -101,6 +111,33 @@ Streaming writes mean captions are saved after each image is processed. The abso
 
 ```bash
 uv run python caption_images.py "path/to/images" -o my_captions.toml
+```
+
+### Disable Sidecar Files
+
+By default, sidecar `.txt` files are created alongside images. To disable this:
+
+```bash
+uv run python caption_images.py "path/to/images" --no-sidecar
+```
+
+This will only create the TOML file without generating individual caption files.
+
+### Write Sidecar Files to a Different Directory
+
+If you have permission issues writing to the image directory (common with Dropbox/cloud storage), write sidecar files to a different location:
+
+```bash
+uv run python caption_images.py "Dropbox\Karatejukka 2023" --sidecar-dir "captions"
+```
+
+This preserves the folder structure relative to the source images. For example:
+```
+Source images:
+  Dropbox\Karatejukka 2023\folder\image.jpg
+
+Sidecar files written to:
+  captions\folder\image.jpg.txt
 ```
 
 ### Processing Large Batches
@@ -115,6 +152,12 @@ The script processes images sequentially with streaming saves. For very large ba
 **OOM (Out of Memory):**
 - Use the 2B model instead of 4B
 - Reduce image size in `resize_image()` (currently 896x896)
+
+**Permission denied writing sidecar files:**
+- Dropbox and other cloud storage services can lock files during sync
+- Use `--no-sidecar` to skip sidecar file creation
+- Or use `--sidecar-dir` to write sidecar files to a local directory outside Dropbox
+- Example: `uv run python caption_images.py "Dropbox\images" --sidecar-dir "captions"`
 
 **Slow Inference:**
 - Ensure Flash Attention 2 is installed
@@ -145,11 +188,6 @@ This project was developed from comprehensive research into vision-language mode
 
 The decision to use Qwen3-VL-2B-Instruct is based on superior speed/quality tradeoff for batch processing scenarios.
 
-## Future Improvements
+## License
 
-Potential enhancements:
-- Batch processing for multiple images
-- Fine-tuning on martial arts-specific captions
-- Integration with image annotation tools
-- WebUI for interactive captioning
-- Multi-GPU distributed processing
+MIT

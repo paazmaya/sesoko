@@ -3,6 +3,7 @@ name = "image-captioner"
 version = "0.1.0"
 description = "Image captioning using PaliGemma 2 for martial arts domain"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.9.1",

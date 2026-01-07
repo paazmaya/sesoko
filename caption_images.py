@@ -9,16 +9,28 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLProcessor,
+)
 
 try:
     import tomli_w
 except ImportError:
     tomli_w = None
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ImportError:
+        tomllib = None
 
 try:
     import pillow_heif
@@ -82,8 +94,15 @@ def resize_image(image: Image.Image, target_size: int = 896) -> Image.Image:
     return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
 
-def load_model_and_processor():
-    """Load Qwen3-VL-4B-Instruct model and processor."""
+def load_model_and_processor() -> tuple[Qwen3VLForConditionalGeneration, Qwen3VLProcessor, str]:
+    """Load Qwen3-VL-4B-Instruct model and processor.
+
+    Returns:
+        Tuple containing:
+            - Qwen3VLForConditionalGeneration: The loaded model
+            - Qwen3VLProcessor: The processor for handling inputs
+            - str: Device string ("cuda" or "cpu")
+    """
     # https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
     # model_id = "H:\\vision-models\\Qwen_Qwen3-VL-4B-Instruct"
     # https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct
@@ -109,15 +128,15 @@ def load_model_and_processor():
 
 def generate_caption(
     model: Qwen3VLForConditionalGeneration,
-    processor: AutoProcessor,
+    processor: Qwen3VLProcessor,
     image: Image.Image,
     device: str,
 ) -> str:
     """Generate caption for an image using Qwen3-VL model.
 
     Args:
-        model: Qwen3-VL model
-        processor: Model processor
+        model: Qwen3-VL model for conditional generation
+        processor: Qwen3VL processor for handling images and text
         image: PIL Image object
         device: Device to use ("cuda" or "cpu")
 
@@ -125,7 +144,7 @@ def generate_caption(
         Generated caption string
     """
     # Detailed prompt for martial arts - instruct model to respond in plain text
-    prompt = "Describe the image, it contains Japanese martial arts. What martial art is shown? Describe clothing, belt, technique, the surrounding area, what kind of emotions the person might show? Respond with plain text only, no formatting or markdown. Be firm, no guessing."
+    prompt = "Describe the image as a caption with less than 255 characters. It contains Japanese martial arts. What martial art is shown? Describe clothing, belt, technique, the surrounding area, what kind of emotions the person might show? Respond with plain text only, no formatting or markdown. Be firm, no guessing."
 
     # Prepare inputs using chat template (following official example)
     messages = [
@@ -141,9 +160,11 @@ def generate_caption(
         }
     ]
 
-    # Prepare inputs - simpler approach
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
+    # Prepare inputs - processor handles both images and text
+    # Note: Qwen3VLProcessor has dynamic typing, using type: ignore
+    inputs: dict[str, Any] = processor(messages, [image])  # type: ignore
+    inputs.pop("token_type_ids", None)
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     # Generate without trimming complexity
     with torch.no_grad():
@@ -154,7 +175,7 @@ def generate_caption(
         )
 
     # Simply decode the entire output
-    caption = processor.decode(outputs[0], skip_special_tokens=True)
+    caption = processor.batch_decode([outputs[0]], skip_special_tokens=True)[0]
 
     # Remove the prompt part if it's in there
     if "assistant" in caption:
@@ -173,6 +194,17 @@ def main():
         type=str,
         default="captions.toml",
         help="Output TOML file path (default: captions.toml)",
+    )
+    parser.add_argument(
+        "--no-sidecar",
+        action="store_true",
+        help="Disable creation of sidecar .txt files with captions",
+    )
+    parser.add_argument(
+        "--sidecar-dir",
+        type=str,
+        default=None,
+        help="Directory to write sidecar .txt files (preserves folder structure)",
     )
 
     args = parser.parse_args()
@@ -200,11 +232,36 @@ def main():
         output_path = output_path.with_suffix(".toml")
 
     print(f"Captions will be saved to {output_path}")
+    if not args.no_sidecar:
+        if args.sidecar_dir:
+            print(f"Sidecar .txt files will be created in {args.sidecar_dir}")
+        else:
+            print("Sidecar .txt files will also be created alongside images")
 
     # Process images and generate captions with streaming writes
     # Get absolute path of the input folder to use as section name
     absolute_folder_path = folder_path.resolve().as_posix()
-    captions: Dict[str, Dict[str, str]] = {absolute_folder_path: {}}
+
+    # Load existing captions if the file exists
+    if output_path.exists() and tomllib:
+        try:
+            with open(output_path, "rb") as f:
+                captions: Dict[str, Dict[str, str]] = tomllib.load(f)
+        except Exception as e:
+            print(f"Warning: Could not read existing captions file: {e}", file=sys.stderr)
+            captions = {}
+    else:
+        captions = {}
+
+    # Only create the section if it doesn't already exist
+    if absolute_folder_path not in captions:
+        captions[absolute_folder_path] = {}
+
+    # Prepare sidecar directory if specified
+    sidecar_base_dir = None
+    if not args.no_sidecar and args.sidecar_dir:
+        sidecar_base_dir = Path(args.sidecar_dir)
+        sidecar_base_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, image_path in enumerate(image_files, 1):
         try:
@@ -237,6 +294,41 @@ def main():
                 with open(output_path.with_suffix(".json"), "w", encoding="utf-8") as f:
                     json.dump(captions, f, indent=2, ensure_ascii=False)
 
+            # Write sidecar .txt file if not disabled
+            if not args.no_sidecar:
+                if sidecar_base_dir:
+                    # Write to sidecar directory, preserving folder structure
+                    relative_path_obj = image_path.relative_to(folder_path)
+                    sidecar_path = sidecar_base_dir / relative_path_obj.with_suffix(
+                        relative_path_obj.suffix + ".txt"
+                    )
+                    # Create subdirectories if needed
+                    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    # Write alongside image
+                    sidecar_path = image_path.with_suffix(image_path.suffix + ".txt")
+
+                try:
+                    with open(sidecar_path, "w", encoding="utf-8") as f:
+                        f.write(caption)
+                except PermissionError:
+                    print(
+                        f"✗ Permission denied writing sidecar file: {sidecar_path}", file=sys.stderr
+                    )
+                    print(
+                        "Stopping processing - cannot write sidecar files with current permissions.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "Use --no-sidecar flag to process without sidecar files.", file=sys.stderr
+                    )
+                    if not args.sidecar_dir:
+                        print(
+                            "Or use --sidecar-dir to write sidecar files to a different location.",
+                            file=sys.stderr,
+                        )
+                    sys.exit(1)
+
             # Clear GPU cache periodically to prevent memory fragmentation
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -248,7 +340,9 @@ def main():
             traceback.print_exc(file=sys.stderr)
             continue
 
-    print(f"\nSuccessfully captioned {len(captions)}/{len(image_files)} images")
+    print(
+        f"\nSuccessfully captioned {len(captions[absolute_folder_path])}/{len(image_files)} images"
+    )
     print(f"Captions saved to {output_path}")
 
 

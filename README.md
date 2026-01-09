@@ -1,6 +1,10 @@
-# Image Captioning for Martial Arts Using Qwen3-VL
+# sesoko (瀬底)
 
-Fast, efficient image captioning for martial arts imagery using **Qwen3-VL-2B-Instruct**.
+> Prepare images for training machice learning models
+
+Two key features:
+* Image captioning for martial arts imagery using **Qwen3-VL-2B-Instruct**
+* Content aware cropping by using YOLO11
 
 ## Quick Start
 
@@ -8,190 +12,106 @@ Fast, efficient image captioning for martial arts imagery using **Qwen3-VL-2B-In
 # Install dependencies
 uv sync
 
-# Run captioning on a folder
-uv run python caption_images.py "path/to/images"
+# Generate captions for images
+uv run python scripts/caption_images.py "path/to/images"
 
-# Output will be saved to captions.toml in the current folder
-# and for each image as sidecar text files under "path/to/images"
+# Crop images based on object detection
+uv run python scripts/crop_yolo.py --input-dir my_images --output-dir cropped_images
 ```
 
-## Current Model
+## Utility Scripts
 
-**Qwen3-VL-2B-Instruct** - Optimized for speed and quality:
-- 🚀 **Ultra-fast inference** with greedy decoding
-- 💾 **Minimal VRAM** (~4-6 GB) - fits on any modern GPU
-- ✨ **High quality** captions for martial arts images
-- 🔄 **Streaming writes** - recovers from interruptions
-- 📝 **Plain text output** - no markdown formatting
+This project provides two main scripts for preparing images for machine learning training:
 
-[View on Hugging Face](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct)
+### 1. Image Captioning with Qwen3-VL
 
-## Features
+Generate detailed captions for images using **Qwen3-VL-2B-Instruct** model.
 
-- ✅ Streams captions to TOML file in real-time
-- ✅ Creates sidecar `.txt` files alongside images (by default)
-- ✅ Aspect-ratio preserving image resizing (896x896 max)
-- ✅ Plain English descriptions without formatting
-- ✅ Graceful error handling with per-image try-catch
-- ✅ Progress tracking with image count
+**Features:**
+- 🚀 Ultra-fast inference with greedy decoding
+- 💾 Minimal VRAM (~4-6 GB) - fits on any modern GPU
+- ✨ High quality captions for martial arts images
+- 🔄 Streaming writes - recovers from interruptions
+- 📝 Plain text output - no markdown formatting
 
-## Alternative Models
+**Basic Usage:**
 
-For higher quality at the cost of slower inference, use the 4B version:
-
-Edit `caption_images.py` line ~86:
-```python
-model_id = "Qwen/Qwen3-VL-4B-Instruct"
+```bash
+uv run python scripts/caption_images.py "path/to/images"
 ```
 
-**4B Model Specs:**
-- Parameters: 4B
-- Speed: ~2x slower than 2B
-- Quality: Higher detail in captions
-- VRAM: ~6-8 GB
+Output will be saved to `captions.toml` in the current folder and as sidecar `.txt` files alongside each image.
 
-## Configuration
+**Advanced Options:**
 
-### Model Loading
+```bash
+# Custom output path
+uv run python scripts/caption_images.py "path/to/images" -o my_captions.toml
 
-The model is loaded with optimizations in `load_model_and_processor()`:
-- `dtype=torch.bfloat16` - Reduced precision for faster inference
-- `low_cpu_mem_usage=True` - Memory efficient loading
-- `device_map="auto"` - Automatic device placement
+# Disable sidecar files (TOML only)
+uv run python scripts/caption_images.py "path/to/images" --no-sidecar
 
-### Generation Parameters
+# Write sidecar files to a different directory
+uv run python scripts/caption_images.py "Dropbox\images" --sidecar-dir "captions"
+```
 
-Captions are generated with these parameters:
-- `max_new_tokens=128` - Maximum caption length
-- `do_sample=False` - Greedy decoding (fastest)
+**Output Format:**
 
-### Output Format
-
-**TOML File** - Captions are saved to TOML format, organized by folder absolute path:
+TOML file organized by folder absolute path:
 ```toml
 ["/absolute/path/to/images/folder"]
 "image1.jpg" = "Caption text here..."
 "image2.jpg" = "Another caption..."
-
-["/another/absolute/path"]
-"photo.jpg" = "Different folder caption..."
 ```
 
-**Sidecar Files** - By default, `.txt` files are created alongside each image:
+Sidecar `.txt` files (optional):
 ```
 images/
   photo1.jpg
-  photo1.jpg.txt     # Contains the caption for photo1.jpg
+  photo1.jpg.txt     # Contains the caption
   photo2.jpg
-  photo2.jpg.txt     # Contains the caption for photo2.jpg
+  photo2.jpg.txt
 ```
 
-Streaming writes mean captions are saved after each image is processed. The absolute path of the input folder is used as the section name in the TOML file, allowing you to organize captions from multiple folders in one file.
+**Configuration:**
 
-## Supported Image Formats
-
-- `.jpg`, `.jpeg`
-- `.png`
-- `.gif`
-- `.webp`
-- `.bmp`
-- `.heic`, `.heif` (with pillow-heif)
-- `.avif`
-
-## Requirements
-
-- Python 3.11+
-- CUDA-capable GPU (Nvidia that is)
-- ~4-6 GB VRAM for 2B model
-- ~6-8 GB VRAM for 4B model
-
-## Advanced Usage
-
-### Custom Output Path
-
-```bash
-uv run python caption_images.py "path/to/images" -o my_captions.toml
+To use the higher-quality 4B model instead, edit the model ID in `scripts/caption_images.py` (~line 86):
+```python
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
 ```
 
-### Disable Sidecar Files
+**Model Specs:**
+- 2B: ~4-6 GB VRAM, ultra-fast
+- 4B: ~6-8 GB VRAM, higher quality
 
-By default, sidecar `.txt` files are created alongside images. To disable this:
+**Supported Image Formats:**
+- `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`, `.bmp`, `.heic`, `.heif`, `.avif`
 
-```bash
-uv run python caption_images.py "path/to/images" --no-sidecar
-```
+**Troubleshooting:**
 
-This will only create the TOML file without generating individual caption files.
+- **OOM (Out of Memory):** Use 2B model or reduce image size in `resize_image()` (currently 896x896)
+- **Permission denied:** Use `--no-sidecar` or `--sidecar-dir` for cloud storage (Dropbox, OneDrive, etc.)
+- **Slow inference:** Ensure CUDA is properly detected with `nvidia-smi`, check Flash Attention 2 installation
 
-### Write Sidecar Files to a Different Directory
+### 2. Image Cropping with YOLO11
 
-If you have permission issues writing to the image directory (common with Dropbox/cloud storage), write sidecar files to a different location:
+Detect and crop objects in images to square format using **YOLO11 segmentation**.
 
-```bash
-uv run python caption_images.py "Dropbox\Karatejukka 2023" --sidecar-dir "captions"
-```
+All output images are **square** without padding or upscaling. The script crops to the smaller dimension of the image, ensuring native resolution quality. Images are saved as optimized JPEG files (quality 85) for efficient storage.
 
-This preserves the folder structure relative to the source images. For example:
-```
-Source images:
-  Dropbox\Karatejukka 2023\folder\image.jpg
-
-Sidecar files written to:
-  captions\folder\image.jpg.txt
-```
-
-### Processing Large Batches
-
-The script processes images sequentially with streaming saves. For very large batches:
-1. Resume interrupted runs - partial results are saved
-2. Monitor GPU memory with `nvidia-smi`
-3. Use 2B model for fastest processing
-
-## Troubleshooting
-
-**OOM (Out of Memory):**
-- Use the 2B model instead of 4B
-- Reduce image size in `resize_image()` (currently 896x896)
-
-**Permission denied writing sidecar files:**
-- Dropbox and other cloud storage services can lock files during sync
-- Use `--no-sidecar` to skip sidecar file creation
-- Or use `--sidecar-dir` to write sidecar files to a local directory outside Dropbox
-- Example: `uv run python caption_images.py "Dropbox\images" --sidecar-dir "captions"`
-
-**Slow Inference:**
-- Ensure Flash Attention 2 is installed
-- Check GPU isn't throttled: `nvidia-smi dmon`
-- Verify CUDA is properly detected
-
-**Missing Files:**
-- Install dependencies: `uv sync`
-- Check image folder path exists
-
-## Notes
-
-- The model focuses on detailed caption generation
-- Prompt explicitly requests plain text (no markdown)
-- GPU cache is cleared after each image to prevent fragmentation
-- Results are appended to the output file (streaming)
-
----
-
-## Utility Scripts
-
-### Image Cropping with YOLO
-
-Detect and crop objects in images using YOLO11 segmentation:
+**Basic Usage:**
 
 ```bash
 # List all available object classes
 uv run python scripts/crop_yolo.py --list-classes
 
-# Center crop all images to 512x512
-uv run python scripts/crop_yolo.py \
-  --input-dir my_images \
-  --output-dir cropped_images
+# Center crop all images to square (512x512)
+uv run python scripts/crop_yolo.py --input-dir my_images --output-dir cropped_images
+```
 
+**Advanced Options:**
+
+```bash
 # Crop focusing on specific objects (person, face, dog, etc.)
 uv run python scripts/crop_yolo.py \
   --input-dir my_images \
@@ -207,7 +127,26 @@ uv run python scripts/crop_yolo.py \
   --stats stats.json
 ```
 
-**Model Precision Conversion** - Convert models to reduced precision for smaller file sizes and faster inference:
+**Features:**
+- Content-aware object detection using YOLO11
+- Square output (no padding, no upscaling) - crops to smallest dimension
+- JPEG format with quality 85 and optimization for minimal file size
+- Smart filtering - skips images without target object
+- Detailed processing statistics (JSON output)
+- Supports any YOLO-detectable object class
+
+**Output Format:**
+- All images are cropped to square (smallest input dimension)
+- Then resized to the specified resolution (default 512x512)
+- Saved as optimized JPEG files (quality 85) in the output directory
+
+---
+
+### 3. Model Precision Conversion
+
+Convert models to reduced precision formats for smaller file sizes and faster inference.
+
+**Basic Usage:**
 
 ```bash
 # Convert to bfloat16 (default)
@@ -220,22 +159,30 @@ uv run python scripts/convert_floats.py --input H:/my-model --dtype e4m3fn
 uv run python scripts/convert_floats.py --input H:/models/model.safetensors
 ```
 
-Supported formats: `bf16`, `e4m3fn`, `e5m2`
+**Supported Formats:** `bf16`, `e4m3fn`, `e5m2`
 
-### GPU Requirements
+---
 
-The image captioning feature requires a CUDA-capable NVIDIA GPU.
+## Requirements
 
-**Setup:**
+- **Python:** 3.11+
+- **GPU:** CUDA-capable NVIDIA GPU
+- **VRAM:** 
+  - Image captioning (2B): ~4-6 GB
+  - Image captioning (4B): ~6-8 GB
+  - Cropping: ~2-4 GB
+
+### Setup
+
 1. Install CUDA 13 drivers from [NVIDIA](https://developer.nvidia.com/cuda-downloads)
-2. Verify: `uv run python -c "import torch; print(torch.cuda.is_available())"`
+2. Verify CUDA availability: `uv run python -c "import torch; print(torch.cuda.is_available())"`
 
 ## Notes
 
-- The model focuses on detailed caption generation for martial arts imagery
-- Prompt explicitly requests plain text (no markdown)
-- GPU cache is cleared after each image to prevent fragmentation
-- Results are appended to the output file (streaming writes mean recovery from interruptions)
+- Image captioning focuses on martial arts imagery with plain text output
+- GPU cache is cleared after each image to prevent memory fragmentation
+- Streaming writes enable recovery from interruptions
+- All scripts process images sequentially
 
 ## License
 

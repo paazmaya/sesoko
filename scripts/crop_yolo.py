@@ -11,7 +11,7 @@ from typing import Optional, Union
 
 import click
 from PIL import Image
-from ultralytics import YOLO
+from ultralytics import YOLO  # type: ignore
 
 
 class YOLOCropper:
@@ -33,24 +33,31 @@ class YOLOCropper:
         """Get list of available object classes YOLO can detect."""
         return list(self.model.names.values())
 
-    def process_image(self, image: Image.Image, skip_if_not_found: bool = True) -> Optional[Image.Image]:
+    def process_image(
+        self, image: Image.Image, skip_if_not_found: bool = True
+    ) -> Optional[Image.Image]:
         """
-        Crop and resize a single image based on YOLO detection.
+        Crop to square and resize a single image based on YOLO detection.
+
+        Always produces a square image by cropping to the smallest dimension,
+        then resizing to the target resolution.
 
         Args:
             image: PIL Image to process
             skip_if_not_found: If True, return None if crop_focus object not found
 
         Returns:
-            Processed image or None if object not found and skip_if_not_found=True
+            Processed square image or None if object not found and skip_if_not_found=True
         """
         if self.crop_focus:
-            image = self._content_aware_crop(image)
-            if image is None and skip_if_not_found:
+            cropped = self._content_aware_crop(image)
+            if cropped is None and skip_if_not_found:
                 return None
-            if image is None:
+            if cropped is None:
                 # No target found, use center crop as fallback
-                image = self._center_crop(Image.open(image)) if isinstance(image, str) else image
+                image = self._center_crop(image)
+            else:
+                image = cropped
         else:
             image = self._center_crop(image)
 
@@ -59,6 +66,9 @@ class YOLOCropper:
 
     def _has_target_object(self, image: Image.Image) -> bool:
         """Check if image contains the target object."""
+        if not self.crop_focus:
+            return False
+
         results = self.model(image, verbose=False)
 
         for result in results:
@@ -74,10 +84,16 @@ class YOLOCropper:
 
     def _content_aware_crop(self, image: Image.Image) -> Optional[Image.Image]:
         """
-        Use YOLO11 to detect the focus object and crop around it.
+        Use YOLO11 to detect the focus object and crop around it to a square.
+
+        Detects the target object, creates a square crop around it with padding,
+        then converts to square using the smaller dimension.
 
         Returns None if target not found.
         """
+        if not self.crop_focus:
+            return None
+
         results = self.model(image, verbose=False)
         target_box = None
 
@@ -116,7 +132,7 @@ class YOLOCropper:
         return self._square_pad(cropped)
 
     def _center_crop(self, image: Image.Image) -> Image.Image:
-        """Standard center crop to square."""
+        """Crop image to square using the smaller dimension (center-aligned, no padding)."""
         width, height = image.size
         new_size = min(width, height)
 
@@ -128,25 +144,31 @@ class YOLOCropper:
         return image.crop((left, top, right, bottom))
 
     def _square_pad(self, image: Image.Image) -> Image.Image:
-        """Pad an image to make it square."""
+        """Crop an image to a square using the smaller dimension.
+
+        The output square will be (min_dimension x min_dimension), ensuring
+        no upscaling or black bars - the larger dimension is cropped.
+        """
         width, height = image.size
         if width == height:
             return image
 
-        max_dim = max(width, height)
-        new_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
+        new_size = min(width, height)
+        left = (width - new_size) / 2
+        top = (height - new_size) / 2
+        right = left + new_size
+        bottom = top + new_size
 
-        left = (max_dim - width) // 2
-        top = (max_dim - height) // 2
-
-        new_img.paste(image, (left, top))
-        return new_img
+        return image.crop((left, top, right, bottom))
 
     def process_folder(
-        self, input_dir: Union[str, Path], output_dir: Union[str, Path], skip_if_not_found: bool = True
+        self,
+        input_dir: Union[str, Path],
+        output_dir: Union[str, Path],
+        skip_if_not_found: bool = True,
     ) -> dict:
         """
-        Process all images in input_dir and save to output_dir.
+        Process all images in input_dir and save to output_dir as optimized JPEG files.
 
         Args:
             input_dir: Path to input images
@@ -181,8 +203,8 @@ class YOLOCropper:
                         stats["skipped"].append(str(file_path))
                         continue
 
-                    output_file = output_path / f"{file_path.stem}.png"
-                    processed.save(output_file)
+                    output_file = output_path / f"{file_path.stem}.jpg"
+                    processed.save(output_file, "JPEG", quality=85, optimize=True)
                     stats["processed"].append(str(file_path))
 
                 except Exception as e:
@@ -228,7 +250,14 @@ class YOLOCropper:
     default=None,
     help="Save processing statistics to JSON file",
 )
-def main(input_dir: str, output_dir: str, crop_focus: Optional[str], resolution: int, list_classes: bool, stats: Optional[str]):
+def main(
+    input_dir: str,
+    output_dir: str,
+    crop_focus: Optional[str],
+    resolution: int,
+    list_classes: bool,
+    stats: Optional[str],
+):
     """
     Crop images using YOLO11 object detection.
 
@@ -261,7 +290,9 @@ def main(input_dir: str, output_dir: str, crop_focus: Optional[str], resolution:
 
     if not input_dir or not output_dir:
         click.echo(click.get_current_context().get_help())
-        raise click.UsageError("--input-dir and --output-dir are required unless using --list-classes")
+        raise click.UsageError(
+            "--input-dir and --output-dir are required unless using --list-classes"
+        )
 
     click.echo(f"Processing images from: {input_dir}")
     if crop_focus:
@@ -269,6 +300,7 @@ def main(input_dir: str, output_dir: str, crop_focus: Optional[str], resolution:
     else:
         click.echo("Crop focus: center crop")
     click.echo(f"Output resolution: {resolution}x{resolution}")
+    click.echo("Output format: JPEG (quality 85, optimized)")
     click.echo(f"Output folder: {output_dir}")
     click.echo()
 

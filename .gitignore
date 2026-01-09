@@ -36,12 +36,18 @@ env/
 *.swo
 *~
 
-# Model caches
+# Model caches (except tracked weights)
 *.bin
-*.pt
 *.safetensors
 
 # Output files
 captions.json
 *.log
 captions.toml
+training_log.json
+logs/
+
+# ML outputs
+checkpoint-*/
+output*/
+

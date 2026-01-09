@@ -177,16 +177,65 @@ The script processes images sequentially with streaming saves. For very large ba
 
 ---
 
-## Research Context (Legacy)
+## Utility Scripts
 
-This project was developed from comprehensive research into vision-language models for martial arts captioning. Original research evaluated:
-- PaliGemma 2
-- LLaVA-7B
-- BLIP-2
-- Flamingo
-- And other VLMs
+### Image Cropping with YOLO
 
-The decision to use Qwen3-VL-2B-Instruct is based on superior speed/quality tradeoff for batch processing scenarios.
+Detect and crop objects in images using YOLO11 segmentation:
+
+```bash
+# List all available object classes
+uv run python scripts/crop_yolo.py --list-classes
+
+# Center crop all images to 512x512
+uv run python scripts/crop_yolo.py \
+  --input-dir my_images \
+  --output-dir cropped_images
+
+# Crop focusing on specific objects (person, face, dog, etc.)
+uv run python scripts/crop_yolo.py \
+  --input-dir my_images \
+  --output-dir cropped_images \
+  --crop-focus person \
+  --resolution 1024
+
+# Save processing statistics
+uv run python scripts/crop_yolo.py \
+  --input-dir my_images \
+  --output-dir cropped_images \
+  --crop-focus face \
+  --stats stats.json
+```
+
+**Model Precision Conversion** - Convert models to reduced precision for smaller file sizes and faster inference:
+
+```bash
+# Convert to bfloat16 (default)
+uv run python scripts/convert_floats.py --input H:/my-model
+
+# Convert to float8 e4m3fn (higher precision)
+uv run python scripts/convert_floats.py --input H:/my-model --dtype e4m3fn
+
+# Convert single safetensors file
+uv run python scripts/convert_floats.py --input H:/models/model.safetensors
+```
+
+Supported formats: `bf16`, `e4m3fn`, `e5m2`
+
+### GPU Requirements
+
+The image captioning feature requires a CUDA-capable NVIDIA GPU.
+
+**Setup:**
+1. Install CUDA 13 drivers from [NVIDIA](https://developer.nvidia.com/cuda-downloads)
+2. Verify: `uv run python -c "import torch; print(torch.cuda.is_available())"`
+
+## Notes
+
+- The model focuses on detailed caption generation for martial arts imagery
+- Prompt explicitly requests plain text (no markdown)
+- GPU cache is cleared after each image to prevent fragmentation
+- Results are appended to the output file (streaming writes mean recovery from interruptions)
 
 ## License
 

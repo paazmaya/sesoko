@@ -1,10 +1,19 @@
 # sesoko (瀬底)
 
-> Prepare images for training machice learning models
+> Prepare images for training machine learning models
 
 Two key features:
 * Image captioning for martial arts imagery using **Qwen3-VL-2B-Instruct**
 * Content aware cropping by using YOLO11
+
+## Architecture
+
+The project uses a shared image handling library (`src/lib/image_utils.py`) to provide common functionality:
+
+- **Image Format Support**: Supports 15+ image formats including JPEG, PNG, GIF, WebP, TIFF, HEIC/HEIF, AVIF, JPEG XL, and more
+- **Image Loading**: Safe image opening with automatic RGB conversion and HEIF support
+- **Image Processing**: Aspect-ratio preserving resizing and square cropping without upscaling or padding
+- **Optimized Output**: JPEG encoding with quality 85 optimization
 
 ## Quick Start
 
@@ -13,10 +22,10 @@ Two key features:
 uv sync
 
 # Generate captions for images
-uv run python scripts/caption_images.py "path/to/images"
+uv run python src/caption_images.py "path/to/images"
 
 # Crop images based on object detection
-uv run python scripts/crop_yolo.py --input-dir my_images --output-dir cropped_images
+uv run python src/crop_yolo.py --input-dir my_images --output-dir cropped_images
 ```
 
 ## Utility Scripts

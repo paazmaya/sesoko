@@ -19,6 +19,12 @@ from transformers import (
     Qwen3VLProcessor,
 )
 
+from lib.image_utils import (
+    get_image_files,
+    open_image,
+    resize_image_aspect_ratio,
+)
+
 try:
     import tomli_w
 except ImportError:
@@ -31,67 +37,6 @@ except ImportError:
         import tomli as tomllib  # type: ignore
     except ImportError:
         tomllib = None
-
-try:
-    import pillow_heif
-
-    pillow_heif.register_heif_opener()
-except ImportError:
-    pass
-
-
-def get_image_files(folder_path: Path) -> list[Path]:
-    """Get all image files from the given folder.
-
-    Args:
-        folder_path: Path to the folder containing images
-
-    Returns:
-        List of paths to image files
-    """
-    image_extensions = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".webp",
-        ".bmp",
-        ".heic",
-        ".heif",
-        ".avif",
-    }
-    image_files = []
-
-    for file in folder_path.rglob("*"):
-        if file.is_file() and file.suffix.lower() in image_extensions:
-            image_files.append(file)
-
-    return sorted(image_files)
-
-
-def resize_image(image: Image.Image, target_size: int = 896) -> Image.Image:
-    """Resize image to fit within target_size x target_size.
-
-    Args:
-        image: PIL Image object
-        target_size: Target size in pixels (default 896x896)
-
-    Returns:
-        Resized PIL Image object
-    """
-    # Calculate aspect ratio
-    aspect_ratio = image.width / image.height
-
-    if aspect_ratio > 1:
-        # Width is larger
-        new_width = target_size
-        new_height = int(target_size / aspect_ratio)
-    else:
-        # Height is larger or equal
-        new_height = target_size
-        new_width = int(target_size * aspect_ratio)
-
-    return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
 
 def load_model_and_processor() -> tuple[Qwen3VLForConditionalGeneration, Qwen3VLProcessor, str]:
@@ -272,8 +217,11 @@ def main():
             )
 
             # Load and resize image
-            image = Image.open(image_path).convert("RGB")
-            image = resize_image(image, target_size=896)
+            image = open_image(image_path)
+            if image is None:
+                print(f"Failed to open image")
+                continue
+            image = resize_image_aspect_ratio(image, target_size=896)
 
             # Generate caption
             caption = generate_caption(model, processor, image, device)

@@ -13,6 +13,13 @@ import click
 from PIL import Image
 from ultralytics import YOLO  # type: ignore
 
+from lib.image_utils import (
+    crop_to_square,
+    get_image_files,
+    open_image,
+    save_image_optimized,
+)
+
 
 class YOLOCropper:
     """Crop images based on YOLO object detection."""
@@ -133,15 +140,7 @@ class YOLOCropper:
 
     def _center_crop(self, image: Image.Image) -> Image.Image:
         """Crop image to square using the smaller dimension (center-aligned, no padding)."""
-        width, height = image.size
-        new_size = min(width, height)
-
-        left = (width - new_size) / 2
-        top = (height - new_size) / 2
-        right = (width + new_size) / 2
-        bottom = (height + new_size) / 2
-
-        return image.crop((left, top, right, bottom))
+        return crop_to_square(image)
 
     def _square_pad(self, image: Image.Image) -> Image.Image:
         """Crop an image to a square using the smaller dimension.
@@ -149,17 +148,7 @@ class YOLOCropper:
         The output square will be (min_dimension x min_dimension), ensuring
         no upscaling or black bars - the larger dimension is cropped.
         """
-        width, height = image.size
-        if width == height:
-            return image
-
-        new_size = min(width, height)
-        left = (width - new_size) / 2
-        top = (height - new_size) / 2
-        right = left + new_size
-        bottom = top + new_size
-
-        return image.crop((left, top, right, bottom))
+        return crop_to_square(image)
 
     def process_folder(
         self,
@@ -191,25 +180,27 @@ class YOLOCropper:
             "failed": [],
         }
 
-        valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        image_files = get_image_files(input_path, recursive=False)
 
-        for file_path in sorted(input_path.iterdir()):
-            if file_path.suffix.lower() in valid_extensions:
-                try:
-                    img = Image.open(file_path).convert("RGB")
-                    processed = self.process_image(img, skip_if_not_found=skip_if_not_found)
-
-                    if processed is None:
-                        stats["skipped"].append(str(file_path))
-                        continue
-
-                    output_file = output_path / f"{file_path.stem}.jpg"
-                    processed.save(output_file, "JPEG", quality=85, optimize=True)
-                    stats["processed"].append(str(file_path))
-
-                except Exception as e:
-                    print(f"Error processing {file_path}: {e}")
+        for file_path in image_files:
+            try:
+                img = open_image(file_path)
+                if img is None:
                     stats["failed"].append(str(file_path))
+                    continue
+                processed = self.process_image(img, skip_if_not_found=skip_if_not_found)
+
+                if processed is None:
+                    stats["skipped"].append(str(file_path))
+                    continue
+
+                output_file = output_path / f"{file_path.stem}.jpg"
+                save_image_optimized(processed, output_file)
+                stats["processed"].append(str(file_path))
+
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+                stats["failed"].append(str(file_path))
 
         return stats
 
@@ -265,19 +256,19 @@ def main(
 
     \b
     # Center crop all images to 512x512
-    python scripts/crop_yolo.py --input-dir images/ --output-dir output/
+    uv run python src/crop_yolo.py --input-dir images/ --output-dir output/
 
     \b
     # Crop focusing on 'person' objects
-    python scripts/crop_yolo.py --input-dir images/ --output-dir output/ --crop-focus person
+    uv run python src/crop_yolo.py --input-dir images/ --output-dir output/ --crop-focus person
 
     \b
     # List all available object classes
-    python scripts/crop_yolo.py --list-classes
+    uv run python src/crop_yolo.py --list-classes
 
     \b
     # Save processing statistics
-    python scripts/crop_yolo.py --input-dir images/ --output-dir output/ --crop-focus face --stats stats.json
+    uv run python src/crop_yolo.py --input-dir images/ --output-dir output/ --crop-focus face --stats stats.json
     """
     cropper = YOLOCropper(crop_focus=crop_focus, resolution=resolution)
 

@@ -50,3 +50,4 @@ logs/
 checkpoint-*/
 output*/
 
+.coverage

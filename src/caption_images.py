@@ -219,7 +219,7 @@ def main():
             # Load and resize image
             image = open_image(image_path)
             if image is None:
-                print(f"Failed to open image")
+                print("Failed to open image")
                 continue
             image = resize_image_aspect_ratio(image, target_size=896)
 

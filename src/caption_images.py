@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
-"""Image captioning script supporting multiple VL models.
-
-This script processes all images in a given folder and generates captions
-using a selectable vision-language model, storing the results in a TOML file.
-
-Supported models:
-  qwen8b   - Qwen3-VL-8B-Abliterated-Caption-it Q2 GGUF (default) — high quality, runs via llama-cpp
-  blip     - Image-Captioning-Blip from Amirhossein75 — fast, keyword-focused
-  caprl    - CapRL-Qwen3VL-2B from internlm
-  qwen3vl  - Qwen3-VL-2B-Instruct from Qwen
-"""
+"""Local martial-arts image captions with optional Transformers or MLX backends."""
 
 import argparse
+import hashlib
+import importlib.util
 import json
+import platform
 import sys
+import tempfile
+import time
+import tomllib
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, cast
 
-import torch
 from PIL import Image
-from transformers import (
-    AutoProcessor,
-    BitsAndBytesConfig,
-    BlipForConditionalGeneration,
-    BlipProcessor,
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLProcessor,
-)
 
 from lib.image_utils import (
     get_image_files,
@@ -39,15 +26,6 @@ try:
 except ImportError:
     tomli_w = None
 
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore
-    except ImportError:
-        tomllib = None
-
-
 # Paths to locally stored models, relative to this file's location
 _MODELS_DIR = Path(__file__).parent.parent / "models"
 
@@ -58,79 +36,166 @@ MODEL_CHOICES: dict[str, Path] = {
     "caprl": _MODELS_DIR / "CapRL-Qwen3VL-2B",
     # https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct
     "qwen3vl": _MODELS_DIR / "Qwen3-VL-2B-Instruct",
+    "qwen35-0.8b": _MODELS_DIR / "Qwen3.5-0.8B",
+    "qwen35-2b": _MODELS_DIR / "Qwen3.5-2B",
 }
 
 # Models that share the Qwen3VL architecture and inference path
-QWEN_MODELS = {"caprl", "qwen3vl"}
+QWEN_MODELS = {"caprl", "qwen3vl", "qwen35-0.8b", "qwen35-2b"}
 
 DEFAULT_MODEL = "qwen3vl"
+CAPTION_PROMPT = (
+    "Describe the visible people, martial-arts clothing and belt colors, weapons, and body "
+    "positions in one plain-text sentence under 255 characters. Use precise martial-arts "
+    "terms only when clearly identifiable. Do not infer rank, a kata name, or unseen details."
+)
+
+
+def load_optional_module(name: str, extra: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        raise RuntimeError(f"{name} requires: uv sync --extra {extra}") from exc
+
+
+def resolve_backend(backend: str, model_key: str, device: str = "auto") -> str:
+    if backend != "auto":
+        return backend
+    if device in {"cpu", "cuda"}:
+        return "transformers"
+    if (
+        model_key != "blip"
+        and sys.platform == "darwin"
+        and platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_vlm") is not None
+    ):
+        return "mlx"
+    return "transformers"
+
+
+def resolve_model_path(model_key: str, backend: str, model_path: str | None) -> Path:
+    if model_path:
+        return Path(model_path).expanduser().resolve()
+    mlx_path = _MODELS_DIR / "Qwen3-VL-2B-Instruct-4bit"
+    if backend == "mlx" and model_key == "qwen3vl" and mlx_path.is_dir():
+        return mlx_path
+    return MODEL_CHOICES[model_key]
+
+
+def configure_pixel_budget(processor: Any, max_pixels: int) -> None:
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+    if hasattr(image_processor, "max_pixels"):
+        image_processor.max_pixels = max_pixels
+        image_processor.min_pixels = min(getattr(image_processor, "min_pixels", 65536), max_pixels)
+    size = getattr(image_processor, "size", None)
+    if isinstance(size, dict) and "longest_edge" in size and "shortest_edge" in size:
+        size = cast(dict[str, Any], size)
+        image_processor.size = {
+            **size,
+            "longest_edge": max_pixels,
+            "shortest_edge": min(size["shortest_edge"], max_pixels),
+        }
 
 
 def load_model_and_processor(
     model_key: str = DEFAULT_MODEL,
-    quantize: str = "int8",
+    quantize: str = "none",
+    *,
+    backend: str = "auto",
+    model_path: str | None = None,
+    device: str = "auto",
+    max_pixels: int = 640 * 640,
 ) -> tuple[Any, Any, str]:
-    """Load a model and processor from local storage.
+    """Load local weights only; optional runtimes are imported on demand."""
+    backend = resolve_backend(backend, model_key, device)
+    path = resolve_model_path(model_key, backend, model_path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Local model not found: {path}. Supply --model-path.")
+    print(f"Loading '{model_key}' with {backend} from {path}...")
+    if backend == "mlx":
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            raise ValueError("The MLX backend requires an Apple Silicon Mac")
+        if model_key == "blip" or device not in {"auto", "mps"} or quantize != "none":
+            raise ValueError("MLX uses its checkpoint precision; omit --quantize and --device")
+        runtime = load_optional_module("mlx_vlm", "caption-mlx")
+        model, processor = runtime.load(str(path), trust_remote_code=False)
+        configure_pixel_budget(processor, max_pixels)
+        print("Using MLX/Metal; precision is defined by the local checkpoint")
+        return model, processor, "mlx"
+    return _load_transformers(model_key, path, device, quantize, max_pixels)
 
-    Args:
-        model_key: One of the keys in MODEL_CHOICES (e.g. "blip", "caprl", "qwen3vl").
-        quantize: Quantization level for Qwen transformer models: "none", "int8", or "int4".
-                  Ignored for BLIP and GGUF models. int8 halves VRAM; int4 quarters it.
-                  Only effective when a CUDA device is available.
 
-    Returns:
-        Tuple containing:
-            - model: The loaded model
-            - processor: The processor for handling inputs
-            - str: Device string ("cuda" or "cpu")
-    """
-    model_path = MODEL_CHOICES[model_key]
-    model_id = str(model_path)
+def select_torch_device(torch: Any, device: str) -> str:
+    if device == "auto":
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+    if device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA requested but unavailable")
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS requested but unavailable")
+    return device
 
-    print(f"Loading model '{model_key}' from {model_id}...")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def torch_dtype(torch: Any, device: str) -> Any:
+    if device == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float16 if device == "mps" else torch.float32
 
-    if model_key == "blip":
-        dtype = torch.float16 if device == "cuda" else torch.float32
-        model = BlipForConditionalGeneration.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        ).to(device)
-        processor = BlipProcessor.from_pretrained(model_id)
-    else:
-        bnb_config = None
-        if quantize != "none" and device == "cuda":
-            if quantize == "int4":
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-            else:  # int8
-                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-        elif quantize != "none" and device == "cpu":
-            print(
-                f"Warning: --quantize {quantize} requires CUDA; skipping quantization.",
-                file=sys.stderr,
-            )
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_id,
-            dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            quantization_config=bnb_config,
+def quantization_options(model_key: str, device: str, quantize: str, dtype: Any) -> dict[str, Any]:
+    if quantize == "none":
+        return {}
+    if device != "cuda" or model_key == "blip":
+        raise ValueError("--quantize requires a Qwen model on CUDA")
+    if importlib.util.find_spec("bitsandbytes") is None:
+        raise RuntimeError(
+            "Quantization requires: uv sync --extra caption-transformers --extra cuda-quantization"
         )
-        processor = AutoProcessor.from_pretrained(model_id)
+    runtime = load_optional_module("transformers", "caption-transformers")
 
-    print(
-        f"Using device: {device}"
-        + (f" | quantize={quantize}" if quantize != "none" and model_key not in ("blip",) else "")
+    return {
+        "quantization_config": runtime.BitsAndBytesConfig(
+            load_in_4bit=quantize == "int4",
+            load_in_8bit=quantize == "int8",
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        ),
+        "device_map": {"": device},
+    }
+
+
+def _load_transformers(
+    model_key: str, path: Path, device: str, quantize: str, max_pixels: int
+) -> tuple[Any, Any, str]:
+    torch = load_optional_module("torch", "caption-transformers")
+    runtime = load_optional_module("transformers", "caption-transformers")
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    if "quantization" in config:
+        raise ValueError("MLX quantized weights require --backend mlx, not Transformers")
+    device = select_torch_device(torch, device)
+    dtype = torch_dtype(torch, device)
+    options: dict[str, Any] = {"dtype": dtype, "local_files_only": True, "trust_remote_code": False}
+    options.update(quantization_options(model_key, device, quantize, dtype))
+    if model_key == "blip":
+        model_class = runtime.BlipForConditionalGeneration
+    else:
+        model_class = runtime.AutoModelForImageTextToText
+    model = model_class.from_pretrained(str(path), **options)
+    if quantize == "none":
+        model = model.to(device)
+    model.eval()
+    processor = runtime.AutoProcessor.from_pretrained(
+        str(path), local_files_only=True, trust_remote_code=False
     )
-
+    if model_key != "blip":
+        configure_pixel_budget(processor, max_pixels)
+    print(f"Using {device} | dtype={dtype} | quantize={quantize}")
     return model, processor, device
 
 
@@ -140,6 +205,7 @@ def generate_caption(
     image: Image.Image,
     device: str,
     model_key: str = DEFAULT_MODEL,
+    max_new_tokens: int = 64,
 ) -> str:
     """Generate caption for an image.
 
@@ -155,62 +221,70 @@ def generate_caption(
     Returns:
         Generated caption string
     """
-    if isinstance(model, BlipForConditionalGeneration):
-        return _generate_caption_blip(model, processor, image, device)
-    return _generate_caption_qwen3vl(model, processor, image, device, model_key)
+    if device == "mlx":
+        runtime = load_optional_module("mlx_vlm", "caption-mlx")
+        templates = load_optional_module("mlx_vlm.prompt_utils", "caption-mlx")
+        prompt = templates.apply_chat_template(
+            processor, model.config, CAPTION_PROMPT, num_images=1, enable_thinking=False
+        )
+        result = runtime.generate(
+            model,
+            processor,
+            prompt,
+            image=[image],
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+            verbose=False,
+        )
+        return result.text.strip()
+    if model_key == "blip":
+        return _generate_caption_blip(model, processor, image, device, max_new_tokens)
+    return _generate_caption_qwen3vl(model, processor, image, device, model_key, max_new_tokens)
 
 
 def _generate_caption_blip(
-    model: BlipForConditionalGeneration,
-    processor: BlipProcessor,
+    model: Any,
+    processor: Any,
     image: Image.Image,
     device: str,
+    max_new_tokens: int = 64,
 ) -> str:
     """Generate a concise, keyword-rich caption using BLIP."""
-    inputs = processor(images=image, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=50, num_beams=5)
+    torch = load_optional_module("torch", "caption-transformers")
+
+    inputs = processor(images=image, return_tensors="pt").to(device, model.dtype)
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs, max_new_tokens=max_new_tokens, num_beams=1, do_sample=False
+        )
     caption: str = processor.decode(outputs[0], skip_special_tokens=True)
     return caption.strip()
 
 
 def _generate_caption_qwen3vl(
-    model: Qwen3VLForConditionalGeneration,
-    processor: Qwen3VLProcessor,
+    model: Any,
+    processor: Any,
     image: Image.Image,
     device: str,
     model_key: str = "qwen3vl",
+    max_new_tokens: int = 64,
 ) -> str:
-    """Generate a detailed caption using a Qwen3-VL-based model.
+    """Generate only the completion using a short, visible-attributes prompt."""
+    torch = load_optional_module("torch", "caption-transformers")
 
-    CapRL uses a concise captioning prompt (it is already RL fine-tuned for detailed
-    captioning), while the base qwen3vl model is guided with a domain-specific prompt.
-    """
-    prompt = (
-        "You are analyzing a Japanese martial arts photograph. "
-        "Identify exactly: (1) the martial art (e.g. karate, judo, aikido, kendo, iaido, naginata, kobudo, jujutsu); "
-        "(2) the specific technique or kata name if visible (use Japanese term); "
-        "(3) any weapons held or used — name each precisely (e.g. bokken, jo, nunchaku, sai, katana, naginata, tonfa); "
-        "(4) practitioner clothing: gi color, hakama if present; "
-        "(5) belt color or rank insignia; "
-        "(6) stance or body position (e.g. zanshin, gedan-barai, chudan-zuki). "
-        "Only provide information that is clearly visible in the image. Do not tell what is not there."
-        "Write a single plain-text sentence under 255 characters. "
-        "Reply only with the positive identifications you are certain of, and do not include any information that is not clearly visible in the image. "
-        "No markdown, no bullet points, no guessing — only describe what is clearly visible."
-    )
-
-    messages = [
+    messages: list[dict[str, Any]] = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": prompt},
+                {"type": "text", "text": CAPTION_PROMPT},
             ],
         }
     ]
 
-    text: str = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)  # type: ignore
+    text: str = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
     inputs: dict[str, Any] = processor(  # type: ignore
         text=[text],
         images=[image],
@@ -218,19 +292,70 @@ def _generate_caption_qwen3vl(
         padding=True,
     )
     inputs.pop("token_type_ids", None)
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    inputs = {
+        key: value.to(device=device, dtype=model.dtype)
+        if value.is_floating_point()
+        else value.to(device)
+        for key, value in inputs.items()
+    }
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=128,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
         )
 
-    caption = processor.batch_decode([outputs[0]], skip_special_tokens=True)[0]
-    if "assistant" in caption:
-        caption = caption.split("assistant")[-1].strip()
-    return caption
+    return decode_completion(processor, outputs, inputs["input_ids"].shape[1])
+
+
+def decode_completion(processor: Any, outputs: Any, input_length: int) -> str:
+    generated = [output[input_length:] for output in outputs]
+    return processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
+
+
+def atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def image_fingerprint(image_path: Path, settings: dict[str, Any]) -> str:
+    stat = image_path.stat()
+    payload: dict[str, Any] = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "settings": settings,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def model_fingerprint(path: Path) -> list[list[str | int]]:
+    return (
+        [
+            [item.name, item.stat().st_size, item.stat().st_mtime_ns]
+            for item in sorted(path.iterdir())
+            if item.is_file() and item.suffix in {".json", ".safetensors", ".jinja", ".txt"}
+        ]
+        if path.is_dir()
+        else []
+    )
+
+
+def sidecar_path_for(image_path: Path, folder_path: Path, args: Any) -> Path | None:
+    if args.no_sidecar:
+        return None
+    if args.sidecar_dir:
+        relative = image_path.relative_to(folder_path)
+        return Path(args.sidecar_dir) / relative.with_suffix(relative.suffix + ".txt")
+    return image_path.with_suffix(image_path.suffix + ".txt")
 
 
 def main():
@@ -253,18 +378,17 @@ def main():
         default=DEFAULT_MODEL,
         help=(
             f"Vision-language model to use for captioning (default: {DEFAULT_MODEL}). "
-            "blip=Image-Captioning-Blip (fast), caprl=CapRL-Qwen3VL-2B, qwen3vl=Qwen3-VL-2B-Instruct"
+            "blip, caprl, qwen3vl, qwen35-0.8b, or qwen35-2b (local weights)"
         ),
     )
     parser.add_argument(
         "--quantize",
         type=str,
         choices=["none", "int8", "int4"],
-        default="int8",
+        default="none",
         help=(
-            "Quantize Qwen transformer models with bitsandbytes (default: int8). "
-            "int8 halves VRAM and speeds up inference; int4 quarters VRAM. "
-            "Has no effect on blip or qwen8b (GGUF). Requires CUDA."
+            "Optional CUDA bitsandbytes quantization (default: none). "
+            "Reduces weight memory; speed depends on hardware. Not used with MLX."
         ),
     )
     parser.add_argument(
@@ -278,8 +402,32 @@ def main():
         default=None,
         help="Directory to write sidecar .txt files (preserves folder structure)",
     )
+    parser.add_argument("--backend", choices=["auto", "transformers", "mlx"], default="auto")
+    parser.add_argument(
+        "--model-path", help="Local compatible model directory; no implicit downloads"
+    )
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument(
+        "--image-size", type=int, default=640, help="Caption preview longest edge (default: 640)"
+    )
+    parser.add_argument(
+        "--max-pixels", type=int, help="Processor pixel budget (default: image-size squared)"
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Regenerate even unchanged captions"
+    )
 
     args = parser.parse_args()
+    if args.image_size < 32 or args.max_new_tokens < 1:
+        parser.error("--image-size must be at least 32; --max-new-tokens must be positive")
+    args.max_pixels = args.max_pixels if args.max_pixels is not None else args.image_size**2
+    if args.max_pixels < 32 * 32:
+        parser.error("--max-pixels must be at least 1024")
+    if tomli_w is None:
+        parser.error("TOML output requires tomli-w; install a caption extra")
+    args.backend = resolve_backend(args.backend, args.model, args.device)
+    model_path = resolve_model_path(args.model, args.backend, args.model_path)
 
     # Validate folder
     folder_path = Path(args.folder)
@@ -294,9 +442,6 @@ def main():
         sys.exit(1)
 
     print(f"Found {len(image_files)} image(s) to process")
-
-    # Load model and processor
-    model, processor, device = load_model_and_processor(args.model, args.quantize)
 
     # Determine output path and format
     output_path = Path(args.output)
@@ -315,19 +460,71 @@ def main():
     absolute_folder_path = folder_path.resolve().as_posix()
 
     # Load existing captions if the file exists
-    if output_path.exists() and tomllib:
+    if output_path.exists():
         try:
             with open(output_path, "rb") as f:
-                captions: Dict[str, Dict[str, str]] = tomllib.load(f)
-        except Exception as e:
-            print(f"Warning: Could not read existing captions file: {e}", file=sys.stderr)
-            captions = {}
+                captions: dict[str, Any] = tomllib.load(f)
+        except (OSError, ValueError) as exc:
+            parser.error(f"Cannot read existing captions; refusing to overwrite: {exc}")
     else:
         captions = {}
 
     # Only create the section if it doesn't already exist
+    if absolute_folder_path in captions and not isinstance(captions[absolute_folder_path], dict):
+        parser.error("Existing caption folder section must be a TOML table")
     if absolute_folder_path not in captions:
         captions[absolute_folder_path] = {}
+
+    metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
+    metadata: dict[str, Any] = {}
+    try:
+        metadata_object: object = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if isinstance(metadata_object, dict):
+            metadata = cast(dict[str, Any], metadata_object)
+    except (OSError, ValueError):
+        metadata = {}
+    if not isinstance(metadata.get(absolute_folder_path), dict):
+        metadata[absolute_folder_path] = {}
+    settings: dict[str, Any] = {
+        "model": str(model_path.resolve()),
+        "model_files": model_fingerprint(model_path),
+        "backend": args.backend,
+        "device": args.device,
+        "quantize": args.quantize,
+        "image_size": args.image_size,
+        "max_pixels": args.max_pixels,
+        "max_new_tokens": args.max_new_tokens,
+        "prompt": CAPTION_PROMPT,
+        "pipeline_version": 1,
+    }
+    pending: list[tuple[Path, str]] = []
+    for image_path in image_files:
+        relative_path = image_path.relative_to(folder_path).as_posix()
+        fingerprint = image_fingerprint(image_path, settings)
+        caption = captions[absolute_folder_path].get(relative_path)
+        if (
+            not args.overwrite
+            and isinstance(caption, str)
+            and caption.strip()
+            and metadata[absolute_folder_path].get(relative_path) == fingerprint
+        ):
+            sidecar = sidecar_path_for(image_path, folder_path, args)
+            if sidecar is not None and not sidecar.exists():
+                atomic_write(sidecar, caption.encode("utf-8"))
+            continue
+        pending.append((image_path, fingerprint))
+    print(f"Skipping {len(image_files) - len(pending)} unchanged image(s)")
+    if not pending:
+        print("Captions are up to date; no model loaded")
+        return
+    model, processor, device = load_model_and_processor(
+        args.model,
+        args.quantize,
+        backend=args.backend,
+        model_path=str(model_path),
+        device=args.device,
+        max_pixels=args.max_pixels,
+    )
 
     # Prepare sidecar directory if specified
     sidecar_base_dir = None
@@ -335,40 +532,38 @@ def main():
         sidecar_base_dir = Path(args.sidecar_dir)
         sidecar_base_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, image_path in enumerate(image_files, 1):
+    failures = 0
+    for idx, (image_path, fingerprint) in enumerate(pending, 1):
         try:
+            started = time.perf_counter()
             print(
-                f"[{idx}/{len(image_files)}] Processing {image_path.name}...",
+                f"[{idx}/{len(pending)}] Processing {image_path.name}...",
                 end=" ",
                 flush=True,
             )
 
             # Load and resize image
             image = open_image(image_path)
-            if image is None:
-                print("Failed to open image")
-                continue
-            target_size = 512 if args.model == "blip" else 896
-            image = resize_image_aspect_ratio(image, target_size=target_size)
+            image = resize_image_aspect_ratio(
+                image, target_size=args.image_size, allow_upscale=False
+            )
 
             # Generate caption
-            caption = generate_caption(model, processor, image, device, args.model)
+            caption = generate_caption(
+                model, processor, image, device, args.model, args.max_new_tokens
+            )
+            if not caption.strip():
+                raise ValueError("Model returned an empty caption")
 
             # Store with relative path as key under the folder section
             relative_path = image_path.relative_to(folder_path).as_posix()
             captions[absolute_folder_path][relative_path] = caption
 
             # Show caption
-            print(f"✓ {caption}")
+            print(f"✓ {caption} ({time.perf_counter() - started:.2f}s)")
 
             # Stream write to TOML file immediately
-            if tomli_w:
-                with open(output_path, "wb") as f:
-                    tomli_w.dump(captions, f)
-            else:
-                # Fallback to JSON if tomli_w not available
-                with open(output_path.with_suffix(".json"), "w", encoding="utf-8") as f:
-                    json.dump(captions, f, indent=2, ensure_ascii=False)
+            atomic_write(output_path, tomli_w.dumps(captions).encode("utf-8"))
 
             # Write sidecar .txt file if not disabled
             if not args.no_sidecar:
@@ -385,8 +580,7 @@ def main():
                     sidecar_path = image_path.with_suffix(image_path.suffix + ".txt")
 
                 try:
-                    with open(sidecar_path, "w", encoding="utf-8") as f:
-                        f.write(caption)
+                    atomic_write(sidecar_path, caption.encode("utf-8"))
                 except PermissionError:
                     print(
                         f"✗ Permission denied writing sidecar file: {sidecar_path}", file=sys.stderr
@@ -405,21 +599,23 @@ def main():
                         )
                     sys.exit(1)
 
-            # Clear GPU cache periodically to prevent memory fragmentation
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            metadata[absolute_folder_path][relative_path] = fingerprint
+            atomic_write(metadata_path, json.dumps(metadata, indent=2).encode("utf-8"))
 
         except Exception as e:
             import traceback
 
             print(f"✗ Error: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+            failures += 1
             continue
 
     print(
         f"\nSuccessfully captioned {len(captions[absolute_folder_path])}/{len(image_files)} images"
     )
     print(f"Captions saved to {output_path}")
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

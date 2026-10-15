@@ -1,6 +1,7 @@
 """Unit tests for image_utils module."""
 
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -10,13 +11,14 @@ from lib.image_utils import (
     crop_to_square,
     get_image_files,
     open_image,
+    prepare_crop,
     resize_image_aspect_ratio,
     save_image_optimized,
 )
 
 
 @pytest.fixture
-def temp_image_dir():
+def temp_image_dir() -> Iterator[Path]:
     """Create a temporary directory with test images."""
     with tempfile.TemporaryDirectory() as tmpdir:
         temp_path = Path(tmpdir)
@@ -50,7 +52,7 @@ def temp_image_dir():
 class TestGetImageFiles:
     """Tests for get_image_files function."""
 
-    def test_get_image_files_recursive(self, temp_image_dir):
+    def test_get_image_files_recursive(self, temp_image_dir: Path):
         """Test finding images recursively."""
         files = get_image_files(temp_image_dir, recursive=True)
         assert len(files) == 5
@@ -61,7 +63,7 @@ class TestGetImageFiles:
         assert "sub_image.png" in filenames
         assert "rgba.png" in filenames
 
-    def test_get_image_files_non_recursive(self, temp_image_dir):
+    def test_get_image_files_non_recursive(self, temp_image_dir: Path):
         """Test finding images non-recursively."""
         files = get_image_files(temp_image_dir, recursive=False)
         assert len(files) == 4
@@ -75,13 +77,13 @@ class TestGetImageFiles:
             files = get_image_files(Path(tmpdir))
             assert len(files) == 0
 
-    def test_get_image_files_sorted(self, temp_image_dir):
+    def test_get_image_files_sorted(self, temp_image_dir: Path):
         """Test that results are sorted."""
         files = get_image_files(temp_image_dir, recursive=False)
         filenames = [f.name for f in files]
         assert filenames == sorted(filenames)
 
-    def test_get_image_files_filters_non_images(self, temp_image_dir):
+    def test_get_image_files_filters_non_images(self, temp_image_dir: Path):
         """Test that non-image files are filtered out."""
         # Create a non-image file
         (temp_image_dir / "readme.txt").write_text("This is not an image")
@@ -93,27 +95,24 @@ class TestGetImageFiles:
 class TestOpenImage:
     """Tests for open_image function."""
 
-    def test_open_image_jpg(self, temp_image_dir):
+    def test_open_image_jpg(self, temp_image_dir: Path):
         """Test opening a JPEG image."""
         img_path = temp_image_dir / "wide.jpg"
         img = open_image(img_path)
-        assert img is not None
         assert img.mode == "RGB"
         assert img.size == (800, 400)
 
-    def test_open_image_png(self, temp_image_dir):
+    def test_open_image_png(self, temp_image_dir: Path):
         """Test opening a PNG image."""
         img_path = temp_image_dir / "tall.png"
         img = open_image(img_path)
-        assert img is not None
         assert img.mode == "RGB"
         assert img.size == (400, 800)
 
-    def test_open_image_rgba_conversion(self, temp_image_dir):
+    def test_open_image_rgba_conversion(self, temp_image_dir: Path):
         """Test that RGBA images are converted to RGB."""
         img_path = temp_image_dir / "rgba.png"
         img = open_image(img_path)
-        assert img is not None
         assert img.mode == "RGB"
         assert img.size == (200, 200)
 
@@ -123,6 +122,20 @@ class TestOpenImage:
             img_path = Path(tmpdir) / "nonexistent.jpg"
             with pytest.raises(Exception):
                 open_image(img_path)
+
+    def test_exif_orientation_applied(self, tmp_path: Path):
+        path = tmp_path / "rotated.jpg"
+        exif = Image.Exif()
+        exif[274] = 6
+        Image.new("RGB", (40, 20)).save(path, exif=exif)
+        image = open_image(path)
+        assert image.size == (20, 40)
+        assert image.getexif().get(274) is None
+
+    def test_transparency_composited_on_white(self, tmp_path: Path):
+        path = tmp_path / "transparent.png"
+        Image.new("RGBA", (2, 2), (255, 0, 0, 0)).save(path)
+        assert open_image(path).getpixel((0, 0)) == (255, 255, 255)
 
 
 class TestResizeImageAspectRatio:
@@ -160,6 +173,14 @@ class TestResizeImageAspectRatio:
         resized = resize_image_aspect_ratio(img, target_size=400)
         # Should not upscale beyond target
         assert max(resized.size) == 400
+
+    def test_preview_does_not_upscale(self):
+        image = Image.new("RGB", (20, 10))
+        assert resize_image_aspect_ratio(image, 640, allow_upscale=False).size == (20, 10)
+
+    def test_thin_image_keeps_positive_dimensions(self):
+        image = Image.new("RGB", (1000, 1))
+        assert resize_image_aspect_ratio(image, 32).size == (32, 1)
 
 
 class TestCropToSquare:
@@ -202,6 +223,54 @@ class TestCropToSquare:
         assert center_pixel[0] > 200  # Red component should be high
 
 
+class TestPrepareCrop:
+    @pytest.mark.parametrize(
+        "box",
+        [(0, 0, 20, 80), (80, 0, 100, 80), (0, 20, 20, 100), (80, 20, 100, 100)],
+    )
+    def test_edge_subject_is_not_clipped(self, box: tuple[int, int, int, int]):
+        from PIL import ImageDraw
+
+        image = Image.new("RGB", (100, 100), "blue")
+        left, top, right, bottom = box
+        ImageDraw.Draw(image).rectangle((left, top, right - 1, bottom - 1), fill="red")
+        result = prepare_crop(image, (80, 80), box, margin=0)
+        red_pixels = sum(pixel == (255, 0, 0) for pixel in result.get_flattened_data())
+        assert result.size == (80, 80)
+        assert red_pixels == 20 * 80
+        assert (255, 255, 255) not in result.get_flattened_data()
+
+    def test_padding_only_when_subject_cannot_fit(self):
+        image = Image.new("RGB", (20, 80), "red")
+        result = prepare_crop(image, (80, 80), (0, 0, 20, 80))
+        assert result.size == (80, 80)
+        assert result.getpixel((0, 40)) == (255, 255, 255)
+        assert sum(pixel == (255, 0, 0) for pixel in result.get_flattened_data()) == 20 * 80
+
+    def test_margin_reduced_before_padding(self):
+        image = Image.new("RGB", (100, 100), "red")
+        result = prepare_crop(image, (100, 100), (0, 0, 100, 100), margin=0.5)
+        assert set(result.get_flattened_data()) == {(255, 0, 0)}
+
+    def test_rectangular_output(self):
+        image = Image.new("RGB", (80, 100), "red")
+        result = prepare_crop(image, (200, 100), (0, 0, 80, 100), margin=0)
+        assert result.size == (200, 100)
+        assert sum(pixel == (255, 0, 0) for pixel in result.get_flattened_data()) == 80 * 100
+
+    @pytest.mark.parametrize("size", [(0, 512), (512, -1)])
+    def test_invalid_output_size(self, size: tuple[int, int]):
+        image = Image.new("RGB", (10, 10))
+        with pytest.raises(ValueError, match="positive"):
+            prepare_crop(image, size)
+
+    @pytest.mark.parametrize("box", [(5, 5, 4, 9), (20, 20, 30, 30), (0, 0, float("nan"), 2)])
+    def test_invalid_subject_box(self, box: tuple[float, float, float, float]):
+        image = Image.new("RGB", (10, 10))
+        with pytest.raises(ValueError):
+            prepare_crop(image, (10, 10), box)
+
+
 class TestSaveImageOptimized:
     """Tests for save_image_optimized function."""
 
@@ -219,6 +288,14 @@ class TestSaveImageOptimized:
             assert loaded.format == "JPEG"
             assert loaded.size == (500, 500)
             loaded.close()
+
+    @pytest.mark.parametrize("output_format", ["png", "webp"])
+    def test_configurable_format(self, tmp_path: Path, output_format: str):
+        path = tmp_path / f"output.{output_format}"
+        save_image_optimized(Image.new("RGB", (10, 20)), path, output_format)
+        with Image.open(path) as image:
+            assert image.format == output_format.upper()
+            assert image.size == (10, 20)
 
     def test_save_image_creates_directories(self):
         """Test that save_image_optimized creates parent directories."""
@@ -265,7 +342,7 @@ class TestSaveImageOptimized:
 class TestImageIntegration:
     """Integration tests combining multiple image operations."""
 
-    def test_full_image_processing_pipeline(self, temp_image_dir):
+    def test_full_image_processing_pipeline(self, temp_image_dir: Path):
         """Test complete image processing: get -> open -> resize -> crop -> save."""
         with tempfile.TemporaryDirectory() as output_dir:
             output_path = Path(output_dir)
@@ -281,7 +358,6 @@ class TestImageIntegration:
 
                 # Open and convert
                 img = open_image(img_file)
-                assert img is not None
 
                 # Resize
                 img = resize_image_aspect_ratio(img, target_size=128)
@@ -298,7 +374,7 @@ class TestImageIntegration:
                 save_image_optimized(img, output)
                 assert output.exists()
 
-    def test_image_pipeline_preserves_content(self, temp_image_dir):
+    def test_image_pipeline_preserves_content(self, temp_image_dir: Path):
         """Test that pipeline doesn't corrupt image content."""
         with tempfile.TemporaryDirectory() as output_dir:
             original_path = temp_image_dir / "square.jpg"
@@ -306,7 +382,6 @@ class TestImageIntegration:
 
             # Load original
             original = open_image(original_path)
-            assert original is not None
             original_color = original.getpixel((250, 250))
             assert isinstance(original_color, tuple)
 

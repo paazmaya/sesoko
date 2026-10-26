@@ -1,13 +1,13 @@
 """Caption workflow tests without loading ML runtimes or weights."""
 
 import json
-import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Never, Self
 
 import pytest
+from click.testing import CliRunner
 from PIL import Image
 
 import caption_images
@@ -80,24 +80,27 @@ def test_caption_resume_and_settings_invalidation(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setattr(caption_images, "load_model_and_processor", load)
     monkeypatch.setattr(caption_images, "generate_caption", generate)
-    argv = ["caption_images.py", str(folder), "-o", str(output), "--backend", "transformers"]
-    monkeypatch.setattr(sys, "argv", argv)
-    caption_images.main()
+    runner = CliRunner()
+    base_args = [str(folder), "-o", str(output), "--backend", "transformers"]
+    result = runner.invoke(caption_images.main, base_args)
+    assert result.exit_code == 0, result.output
     assert calls == [((100, 50), 64)]
     assert len(loads) == 1
     data = tomllib.loads(output.read_text())
-    assert data[str(folder)]["photo.png"] == "A practitioner in a red gi."
+    assert data[folder.resolve().as_posix()]["photo.png"] == "A practitioner in a red gi."
     sidecar = folder / "photo.png.txt"
     sidecar.unlink()
-    caption_images.main()
+    result = runner.invoke(caption_images.main, base_args)
+    assert result.exit_code == 0, result.output
     assert len(calls) == 1
     assert len(loads) == 1
     assert sidecar.read_text() == "A practitioner in a red gi."
-    monkeypatch.setattr(sys, "argv", argv + ["--image-size", "512"])
-    caption_images.main()
+    result = runner.invoke(caption_images.main, base_args + ["--image-size", "512"])
+    assert result.exit_code == 0, result.output
     assert len(calls) == 2
     Image.new("RGB", (120, 60), "blue").save(folder / "photo.png")
-    caption_images.main()
+    result = runner.invoke(caption_images.main, base_args + ["--image-size", "512"])
+    assert result.exit_code == 0, result.output
     assert len(calls) == 3
     assert json.loads(output.with_suffix(".toml.meta.json").read_text())
 
@@ -242,3 +245,110 @@ def test_qwen_inference_preserves_integer_ids_and_casts_pixels(monkeypatch: pyte
     assert result == "A practitioner and an assistant hold a staff."
     assert moves["ids"] == (("cuda",), {})
     assert moves["pixels"] == ((), {"device": "cuda", "dtype": "float16"})
+
+
+def test_blip_caption_generation_uses_greedy_decoding(monkeypatch: pytest.MonkeyPatch):
+    from contextlib import nullcontext
+
+    class FakeInputs(dict[str, object]):
+        def to(self, device: str, dtype: object) -> Self:
+            self["device"] = device
+            self["dtype"] = dtype
+            return self
+
+    class Processor:
+        def __call__(self, *, images: Image.Image, return_tensors: str) -> FakeInputs:
+            assert return_tensors == "pt"
+            assert images.size == (16, 16)
+            return FakeInputs(pixel_values="pixels")
+
+        def decode(self, tokens: list[int], *, skip_special_tokens: bool) -> str:
+            assert tokens == [10, 20]
+            assert skip_special_tokens is True
+            return "  two karate practitioners sparring  "
+
+    def generate(**kwargs: object) -> list[list[int]]:
+        assert kwargs["pixel_values"] == "pixels"
+        assert kwargs["num_beams"] == 1
+        assert kwargs["do_sample"] is False
+        assert kwargs["max_new_tokens"] == 32
+        return [[10, 20]]
+
+    monkeypatch.setattr(
+        caption_images,
+        "load_optional_module",
+        lambda *_args: SimpleNamespace(inference_mode=nullcontext),
+    )
+    caption = caption_images.generate_caption(
+        SimpleNamespace(dtype="float32", generate=generate),
+        Processor(),
+        Image.new("RGB", (16, 16)),
+        "cpu",
+        model_key="blip",
+        max_new_tokens=32,
+    )
+    assert caption == "two karate practitioners sparring"
+
+
+def test_mlx_loader_and_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(caption_images.sys, "platform", "darwin")
+    monkeypatch.setattr(caption_images.platform, "machine", lambda: "arm64")
+    processor = SimpleNamespace(
+        image_processor=SimpleNamespace(min_pixels=65536, max_pixels=1000000)
+    )
+    model = SimpleNamespace(config={"model_type": "qwen3_vl"})
+
+    def fake_load(path: str, *, trust_remote_code: bool) -> tuple[SimpleNamespace, SimpleNamespace]:
+        assert path == str(tmp_path)
+        assert trust_remote_code is False
+        return model, processor
+
+    def fake_generate(
+        loaded_model: object,
+        loaded_processor: object,
+        prompt: str,
+        *,
+        image: list[Image.Image],
+        max_tokens: int,
+        temperature: float,
+        verbose: bool,
+    ) -> SimpleNamespace:
+        assert loaded_model is model
+        assert loaded_processor is processor
+        assert prompt == "formatted-prompt"
+        assert len(image) == 1
+        assert max_tokens == 48
+        assert temperature == 0.0
+        assert verbose is False
+        return SimpleNamespace(text=" A judoka grips a white lapel. ")
+
+    def fake_module(name: str, _extra: str) -> SimpleNamespace:
+        if name == "mlx_vlm":
+            return SimpleNamespace(load=fake_load, generate=fake_generate)
+        return SimpleNamespace(
+            apply_chat_template=lambda *_args, **_kwargs: "formatted-prompt",
+        )
+
+    monkeypatch.setattr(caption_images, "load_optional_module", fake_module)
+    loaded = caption_images.load_model_and_processor(
+        "qwen3vl",
+        backend="mlx",
+        model_path=str(tmp_path),
+        max_pixels=262144,
+    )
+    assert loaded == (model, processor, "mlx")
+    assert processor.image_processor.max_pixels == 262144
+
+    text = caption_images.generate_caption(
+        model, processor, Image.new("RGB", (32, 32)), "mlx", max_new_tokens=48
+    )
+    assert text == "A judoka grips a white lapel."
+
+
+def test_model_fingerprint_includes_weights_and_tokenizer_files(tmp_path: Path):
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "pytorch_model.bin").write_bytes(b"weights")
+    (tmp_path / "tokenizer.model").write_bytes(b"spm")
+    (tmp_path / "ignored.tmp").write_bytes(b"skip")
+    names = [entry[0] for entry in caption_images.model_fingerprint(tmp_path)]
+    assert names == ["config.json", "pytorch_model.bin", "tokenizer.model"]

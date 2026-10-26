@@ -1,11 +1,12 @@
-"""Shared image handling utilities for caption and cropping scripts."""
+"""Shared image handling and atomic file utilities for caption and cropping scripts."""
 
 import importlib
 import math
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
 
 # Support all common image formats
 SUPPORTED_IMAGE_EXTENSIONS = {
@@ -37,23 +38,37 @@ try:
 except ImportError:
     pass
 
-try:
-    from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = False
 
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-except ImportError:
-    pass
+
+def atomic_write(path: Path, content: bytes) -> None:
+    """Atomically write bytes to ``path`` using a temporary file in the same directory.
+
+    Args:
+        path: Destination file path.
+        content: Raw bytes to write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def get_image_files(folder_path: Path, recursive: bool = True) -> list[Path]:
-    """Get all image files from the given folder.
+    """Get all supported image files from the given folder.
 
     Args:
-        folder_path: Path to the folder containing images
-        recursive: If True, search recursively; if False, only search top level
+        folder_path: Path to the folder containing images.
+        recursive: If True, search recursively; if False, only search top level.
 
     Returns:
-        List of paths to image files, sorted
+        Sorted list of paths to supported image files.
     """
     image_files: list[Path] = []
     iterator = folder_path.rglob("*") if recursive else folder_path.iterdir()
@@ -65,38 +80,49 @@ def get_image_files(folder_path: Path, recursive: bool = True) -> list[Path]:
     return sorted(image_files)
 
 
+def _to_rgb(image: Image.Image, background: str = "white") -> Image.Image:
+    """Convert any PIL image to RGB, compositing transparency onto ``background``."""
+    if "A" in image.getbands() or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        canvas = Image.new("RGBA", rgba.size, background)
+        return Image.alpha_composite(canvas, rgba).convert("RGB")
+    return image.convert("RGB")
+
+
 def open_image(image_path: Path) -> Image.Image:
-    """Safely open an image file and convert to RGB.
+    """Open, validate, EXIF-transpose, and convert an image file to RGB.
 
     Args:
-        image_path: Path to the image file
+        image_path: Path to the image file.
 
     Returns:
-        PIL Image in RGB mode, or None if unable to open
+        Decoded PIL Image in RGB mode with transparency composited on white.
 
     Raises:
-        Exception: Re-raises any exception that occurs during opening
+        OSError: If the file cannot be opened or is truncated/corrupted.
     """
     with Image.open(image_path) as source:
+        source.load()
         image = ImageOps.exif_transpose(source)
-        if "A" in image.getbands() or "transparency" in image.info:
-            rgba = image.convert("RGBA")
-            background = Image.new("RGBA", rgba.size, "white")
-            return Image.alpha_composite(background, rgba).convert("RGB")
-        return image.convert("RGB")
+        return _to_rgb(image)
 
 
 def resize_image_aspect_ratio(
     image: Image.Image, target_size: int, *, allow_upscale: bool = True
 ) -> Image.Image:
-    """Resize image to fit within target_size maintaining aspect ratio.
+    """Resize image so its longest side matches ``target_size`` while preserving aspect ratio.
 
     Args:
-        image: PIL Image object
-        target_size: Target size in pixels (longest side)
+        image: PIL Image object.
+        target_size: Target size in pixels for the longest edge.
+        allow_upscale: When False, return the original image if its longest edge is
+            already at or below ``target_size``.
 
     Returns:
-        Resized PIL Image object
+        Resized PIL Image object.
+
+    Raises:
+        ValueError: If ``target_size`` is not positive.
     """
     if target_size <= 0:
         raise ValueError("Target size must be positive")
@@ -136,7 +162,23 @@ def prepare_crop(
     margin: float = 0.2,
     background: str = "white",
 ) -> Image.Image:
-    """Fit a subject into an exact-size crop without clipping or stretching it."""
+    """Fit a subject into an exact-size crop without clipping or stretching it.
+
+    Args:
+        image: Source PIL Image.
+        output_size: Target ``(width, height)`` in pixels.
+        subject_box: Optional ``(left, top, right, bottom)`` bounding box in image
+            coordinates. When ``None``, performs a center-aligned aspect-fill crop.
+        margin: Fractional extra context margin around ``subject_box`` (e.g., ``0.2``
+            adds 20% width and height when space permits before padding).
+        background: Fill color used only when padding is required to preserve aspect ratio.
+
+    Returns:
+        Exact-size PIL Image of dimensions ``output_size``.
+
+    Raises:
+        ValueError: If ``output_size``, ``margin``, or ``subject_box`` is invalid.
+    """
     width, height = output_size
     if width <= 0 or height <= 0:
         raise ValueError("Output dimensions must be positive")
@@ -187,16 +229,26 @@ def prepare_crop(
 def save_image_optimized(
     image: Image.Image, output_path: Path, output_format: str = "jpeg", quality: int = 85
 ) -> None:
-    """Save image as optimized JPEG.
+    """Save an image in JPEG, PNG, or WebP format with optimization enabled.
+
+    Non-RGB images (such as RGBA or palette images) are converted to RGB with
+    white alpha compositing when saving as JPEG.
 
     Args:
-        image: PIL Image object to save
-        output_path: Path where to save the image
+        image: PIL Image object to save.
+        output_path: Destination file path.
+        output_format: Target image format (``"jpeg"``, ``"png"``, or ``"webp"``).
+        quality: Compression quality in ``[1, 100]`` for JPEG and WebP outputs.
+
+    Raises:
+        ValueError: If ``output_format`` or ``quality`` is out of range.
     """
     if output_format not in {"jpeg", "png", "webp"} or not 1 <= quality <= 100:
         raise ValueError("Expected jpeg/png/webp format and quality in [1, 100]")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    options = {"optimize": True} if output_format == "png" else {"quality": quality}
+    if output_format == "jpeg" and image.mode != "RGB":
+        image = _to_rgb(image)
+    options: dict[str, Any] = {"optimize": True} if output_format == "png" else {"quality": quality}
     if output_format == "jpeg":
         options["optimize"] = True
     image.save(output_path, output_format.upper(), **options)

@@ -137,6 +137,15 @@ class TestOpenImage:
         Image.new("RGBA", (2, 2), (255, 0, 0, 0)).save(path)
         assert open_image(path).getpixel((0, 0)) == (255, 255, 255)
 
+    def test_truncated_image_rejected(self, tmp_path: Path):
+        """Test that truncated image files raise OSError instead of silently decoding."""
+        path = tmp_path / "truncated.png"
+        Image.new("RGB", (128, 128), color="red").save(path, format="PNG", compress_level=0)
+        raw = path.read_bytes()
+        path.write_bytes(raw[: len(raw) // 2])
+        with pytest.raises(OSError):
+            open_image(path)
+
 
 class TestResizeImageAspectRatio:
     """Tests for resize_image_aspect_ratio function."""
@@ -323,20 +332,19 @@ class TestSaveImageOptimized:
             loaded.close()
 
     def test_save_rgba_image_converts_to_rgb(self):
-        """Test that RGBA images are properly handled."""
+        """Test that RGBA images are converted to RGB with white compositing when saved as JPEG."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create RGBA image
-            img = Image.new("RGBA", (200, 200), color=(255, 0, 0, 128))
+            img = Image.new("RGBA", (20, 20), color=(255, 0, 0, 0))
             output_path = Path(tmpdir) / "rgba_output.jpg"
 
-            # Need to convert before saving as JPEG
-            img_rgb = img.convert("RGB")
-            save_image_optimized(img_rgb, output_path)
+            save_image_optimized(img, output_path)
 
-            loaded = Image.open(output_path)
-            assert loaded.mode == "RGB"
-            assert loaded.format == "JPEG"
-            loaded.close()
+            with Image.open(output_path) as loaded:
+                assert loaded.mode == "RGB"
+                assert loaded.format == "JPEG"
+                pixel = loaded.getpixel((10, 10))
+                assert isinstance(pixel, tuple)
+                assert all(channel > 250 for channel in pixel)
 
 
 class TestImageIntegration:
@@ -353,9 +361,6 @@ class TestImageIntegration:
 
             # Process each image
             for img_file in images:
-                if img_file.name == "rgba.png":
-                    continue  # Skip RGBA for JPEG save
-
                 # Open and convert
                 img = open_image(img_file)
 

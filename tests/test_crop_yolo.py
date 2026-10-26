@@ -61,21 +61,51 @@ class TestYOLOCropperInit:
 
 
 class TestYOLOCropperAvailableClasses:
-    """Tests for available classes method."""
+    """Tests for available classes method and YOLODetector adapter."""
 
-    def test_get_available_classes_returns_list(self):
-        """Test that get_available_classes returns a list."""
+    def test_get_available_classes_delegates_to_detector(self):
+        """Test that get_available_classes returns the configured detector's class list."""
         cropper = YOLOCropper()
         classes = cropper.get_available_classes()
-        assert isinstance(classes, list)
-        assert len(classes) > 0
+        assert classes == ["person", "car", "dog", "cat"]
 
-    def test_get_available_classes_contains_common_objects(self):
-        """Test that available classes contain common YOLO object types."""
-        cropper = YOLOCropper()
-        classes = cropper.get_available_classes()
-        # YOLO11 should detect common objects
-        assert any(c.lower() in classes for c in ["person", "car", "dog", "cat"])
+    def test_yolo_detector_adapter_maps_boxes_and_names(self, monkeypatch: pytest.MonkeyPatch):
+        """Test that YOLODetector extracts xyxy boxes, confidences, and class labels."""
+        from types import SimpleNamespace
+
+        from lib.person_detection import YOLODetector
+
+        class FakeTensor:
+            def __init__(self, values: list[float]) -> None:
+                self._values = values
+
+            def tolist(self) -> list[float]:
+                return self._values
+
+        box = SimpleNamespace(
+            xyxy=[FakeTensor([10.5, 20.0, 110.5, 220.0])],
+            conf=[0.875],
+            cls=[0],
+        )
+
+        class FakeYOLO:
+            def __init__(self, model_path: str) -> None:
+                self.model_path = model_path
+                self.names = {0: "person", 1: "bicycle"}
+
+            def __call__(self, image: Image.Image, *, verbose: bool) -> list[SimpleNamespace]:
+                assert verbose is False
+                assert image.size == (200, 300)
+                return [SimpleNamespace(boxes=[box])]
+
+        monkeypatch.setattr(
+            "lib.person_detection.importlib.import_module",
+            lambda name: SimpleNamespace(YOLO=FakeYOLO),
+        )
+        detector = YOLODetector("custom.pt")
+        assert detector.get_available_classes() == ["person", "bicycle"]
+        detections = detector.detect(Image.new("RGB", (200, 300)))
+        assert detections == [Detection((10.5, 20.0, 110.5, 220.0), 0.875, "person")]
 
 
 class TestYOLOCropperProcessImage:
@@ -330,6 +360,35 @@ class TestDEIMDetector:
         assert detections[0].box == (20, 10, 180, 90)
         assert detections[0].label == "person"
 
+    def test_non_divisible_aspect_ratio_coordinate_restoration(self):
+        from types import SimpleNamespace
+
+        np = pytest.importorskip("numpy")
+        from lib.person_detection import DEIMDetector
+
+        class Session:
+            def get_inputs(self) -> list[SimpleNamespace]:
+                return [
+                    SimpleNamespace(name="images", shape=["N", 3, 100, 100], type="tensor(float)"),
+                    SimpleNamespace(name="orig_target_sizes", type="tensor(int64)"),
+                ]
+
+            def get_outputs(self) -> list[SimpleNamespace]:
+                return [SimpleNamespace(name=name) for name in ("scores", "boxes", "labels")]
+
+            def run(self, _names: list[str], _inputs: dict[str, Any]) -> tuple[Any, Any, Any]:
+                # 333x100 resized into 100x100 -> resized_size=(100, 30), padding=(0, 35)
+                return (
+                    np.array([[0]]),
+                    np.array([[[0.0, 35.0, 100.0, 65.0]]]),
+                    np.array([[0.95]]),
+                )
+
+        detector = DEIMDetector("unused.onnx", session=Session())
+        detections = detector.detect(Image.new("RGB", (333, 100), "red"))
+        assert len(detections) == 1
+        assert detections[0].box == pytest.approx((0.0, 0.0, 333.0, 100.0))
+
     def test_model_contract_rejected(self):
         from types import SimpleNamespace
 
@@ -415,3 +474,55 @@ def test_crop_cli_rectangular_png_without_ml(tmp_path: Path):
     with Image.open(output_path / "photo.png") as image:
         assert image.size == (64, 96)
         assert image.format == "PNG"
+
+
+def test_crop_cli_list_classes_and_stats_protection(tmp_path: Path):
+    import json
+
+    from click.testing import CliRunner
+
+    from crop_yolo import main
+
+    runner = CliRunner()
+    list_result = runner.invoke(main, ["--list-classes"])
+    assert list_result.exit_code == 0, list_result.output
+    assert "person" in list_result.output
+
+    input_path = tmp_path / "input"
+    input_path.mkdir()
+    existing_image = input_path / "photo.jpg"
+    Image.new("RGB", (64, 64), "red").save(existing_image)
+    output_path = tmp_path / "output"
+
+    blocked = runner.invoke(
+        main,
+        [
+            "--input-dir",
+            str(input_path),
+            "--output-dir",
+            str(output_path),
+            "--stats",
+            str(existing_image),
+        ],
+    )
+    assert blocked.exit_code != 0
+    assert "must not overwrite" in blocked.output
+
+    stats_file = tmp_path / "stats.json"
+    fallback_result = runner.invoke(
+        main,
+        [
+            "--input-dir",
+            str(input_path),
+            "--output-dir",
+            str(output_path),
+            "--crop-focus",
+            "person",
+            "--fallback-center",
+            "--stats",
+            str(stats_file),
+        ],
+    )
+    assert fallback_result.exit_code == 0, fallback_result.output
+    saved_stats = json.loads(stats_file.read_text(encoding="utf-8"))
+    assert saved_stats["processed"] == [str(existing_image.resolve())]

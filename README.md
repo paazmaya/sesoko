@@ -12,6 +12,8 @@ uv sync
 uv run python src/crop_yolo.py --input-dir images --output-dir prepared
 ```
 
+Installed console entry points `sesoko-crop` and `sesoko-caption` are also available via `uv run`.
+
 Install only the extras needed for the current workflow:
 
 | Extra                  | Purpose                                                    |
@@ -152,6 +154,8 @@ The runtime is ONNX Runtime CPU; Torch and the upstream training code are not ne
 ## Local Captioning
 
 Caption the **prepared folder** so descriptions match the content kept in the training images.
+Unlike `crop_yolo.py` (which scans top-level files only), `caption_images.py` scans the input
+directory recursively and preserves relative subfolder paths in `captions.toml` and `--sidecar-dir`.
 Caption previews stay in memory and do not change saved output dimensions or encoding.
 
 Download a complete model directory before running captioning; tokenizer and processor files

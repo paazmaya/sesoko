@@ -10,7 +10,7 @@ import click
 from PIL import Image
 
 from lib.image_utils import (
-    crop_to_square,
+    atomic_write,
     get_image_files,
     open_image,
     prepare_crop,
@@ -20,6 +20,8 @@ from lib.person_detection import DEIMDetector, Detector, YOLODetector
 
 
 class CropStats(TypedDict):
+    """Summary of a folder cropping run."""
+
     base_folder: str
     output_folder: str
     crop_focus: str
@@ -46,12 +48,21 @@ class YOLOCropper:
         output_format: str = "jpeg",
         quality: int = 85,
     ) -> None:
-        """
-        Initialize the YOLO cropper.
+        """Initialize the image cropper.
 
         Args:
-            crop_focus: Object class to focus on (e.g., 'person' or YOLO's 'dog').
-            resolution: Default output width and height, independently overridable.
+            crop_focus: Object class to focus on (e.g., ``'person'`` or YOLO's ``'dog'``).
+                When ``None``, center-crops without loading a detector.
+            resolution: Default output width and height in pixels.
+            detector: Optional pre-initialized ``Detector`` instance.
+            backend: Detector backend name (``'yolo'`` or ``'deim'``).
+            model_path: Optional path to detector model weights or ONNX export.
+            confidence: Minimum detection confidence threshold in ``[0, 1]``.
+            margin: Fractional context margin around the detected box (``>= 0``).
+            width: Optional explicit output width overriding ``resolution``.
+            height: Optional explicit output height overriding ``resolution``.
+            output_format: Output image format (``'jpeg'``, ``'png'``, or ``'webp'``).
+            quality: Compression quality in ``[1, 100]`` for JPEG and WebP outputs.
         """
         self.crop_focus = crop_focus
         self.resolution = resolution
@@ -76,6 +87,7 @@ class YOLOCropper:
 
     @property
     def model(self) -> Any:
+        """Return the underlying detector model when loaded, or ``None``."""
         return getattr(self._detector, "model", None)
 
     def _get_detector(self) -> Detector:
@@ -89,31 +101,26 @@ class YOLOCropper:
         return self._detector
 
     def get_available_classes(self) -> list[str]:
-        """Get list of available object classes YOLO can detect."""
+        """Get list of available object classes the configured detector can detect."""
         return self._get_detector().get_available_classes()
 
     def process_image(
         self, image: Image.Image, skip_if_not_found: bool = True
     ) -> Optional[Image.Image]:
-        """
-        Prepare an exact-size center crop or retain the largest detected subject.
+        """Prepare an exact-size center crop or retain the largest detected subject.
 
         Args:
-            image: PIL Image to process
-            skip_if_not_found: If True, return None if crop_focus object not found
+            image: PIL Image to process.
+            skip_if_not_found: If True, return ``None`` if ``crop_focus`` object is not found.
 
         Returns:
-            Processed image or None if object not found and skip_if_not_found=True.
+            Processed image or ``None`` if object not found and ``skip_if_not_found=True``.
         """
         if self.crop_focus:
             cropped = self._content_aware_crop(image)
             if cropped is not None or skip_if_not_found:
                 return cropped
         return prepare_crop(image, self.output_size)
-
-    def _has_target_object(self, image: Image.Image) -> bool:
-        """Check if image contains the target object."""
-        return bool(self.crop_focus and self._select_target(image))
 
     def _select_target(
         self, image: Image.Image
@@ -151,18 +158,6 @@ class YOLOCropper:
         if target is None:
             return None
         return prepare_crop(image, self.output_size, target[0], self.margin)
-
-    def _center_crop(self, image: Image.Image) -> Image.Image:
-        """Crop image to square using the smaller dimension (center-aligned, no padding)."""
-        return crop_to_square(image)
-
-    def _square_pad(self, image: Image.Image) -> Image.Image:
-        """Crop an image to a square using the smaller dimension.
-
-        The output square will be (min_dimension x min_dimension), ensuring
-        no upscaling or black bars - the larger dimension is cropped.
-        """
-        return crop_to_square(image)
 
     def _output_path(self, file_path: Path, output_path: Path, stem_counts: dict[str, int]) -> Path:
         stem = file_path.name if stem_counts[file_path.stem.casefold()] > 1 else file_path.stem
@@ -234,6 +229,22 @@ class YOLOCropper:
                 stats["failed"].append(str(file_path))
 
         return stats
+
+
+def _resolve_stats_path(stats: str | None, input_dir: str) -> Path | None:
+    """Validate and return the destination ``--stats`` path, or ``None`` if omitted."""
+    if not stats:
+        return None
+    stats_path = Path(stats)
+    resolved_stats = stats_path.resolve()
+    resolved_input = Path(input_dir).resolve()
+    if resolved_stats == resolved_input or (
+        resolved_stats.parent == resolved_input and resolved_stats.exists()
+    ):
+        raise click.ClickException(
+            "--stats path must not overwrite an existing file in --input-dir"
+        )
+    return stats_path
 
 
 @click.command()
@@ -339,11 +350,10 @@ def main(
             "--input-dir and --output-dir are required unless using --list-classes"
         )
 
+    stats_path = _resolve_stats_path(stats, input_dir)
+
     click.echo(f"Processing images from: {input_dir}")
-    if crop_focus:
-        click.echo(f"Crop focus: {crop_focus}")
-    else:
-        click.echo("Crop focus: center crop")
+    click.echo(f"Crop focus: {crop_focus or 'center crop'}")
     click.echo(f"Output resolution: {cropper.output_size[0]}x{cropper.output_size[1]}")
     click.echo(f"Output format: {cropper.output_format.upper()} (quality {cropper.quality})")
     click.echo(f"Output folder: {output_dir}")
@@ -358,11 +368,8 @@ def main(
     click.echo(f"Skipped: {len(result_stats['skipped'])} images")
     click.echo(f"Failed: {len(result_stats['failed'])} images")
 
-    if stats:
-        stats_path = Path(stats)
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stats_path, "w") as f:
-            json.dump(result_stats, f, indent=2)
+    if stats_path is not None:
+        atomic_write(stats_path, json.dumps(result_stats, indent=2).encode("utf-8"))
         click.echo(f"Statistics saved to: {stats}")
     if result_stats["failed"]:
         raise click.ClickException(f"Failed to process {len(result_stats['failed'])} image(s)")

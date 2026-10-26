@@ -494,7 +494,7 @@ wheels = [
 [[package]]
 name = "diffusers"
 version = "0.37.0.dev0"
-source = { git = "https://github.com/huggingface/diffusers.git#8600b4c10d67b0ce200f664204358747bd53c775" }
+source = { git = "https://github.com/huggingface/diffusers.git?rev=8600b4c10d67b0ce200f664204358747bd53c775#8600b4c10d67b0ce200f664204358747bd53c775" }
 dependencies = [
     { name = "filelock" },
     { name = "httpx" },
@@ -2122,7 +2122,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'caption-transformers'", specifier = ">=1.12.0" },
     { name = "bitsandbytes", marker = "sys_platform != 'darwin' and extra == 'cuda-quantization'", specifier = ">=0.49.0" },
     { name = "click", specifier = ">=8.3.1" },
-    { name = "diffusers", marker = "extra == 'training'", git = "https://github.com/huggingface/diffusers.git" },
+    { name = "diffusers", marker = "extra == 'training'", git = "https://github.com/huggingface/diffusers.git?rev=8600b4c10d67b0ce200f664204358747bd53c775" },
     { name = "matplotlib", marker = "extra == 'training'", specifier = ">=3.10.7" },
     { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'caption-mlx'", specifier = ">=0.3.12" },
     { name = "numpy", marker = "extra == 'detector-onnx'", specifier = ">=2.2,!=2.4.0" },

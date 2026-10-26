@@ -28,9 +28,10 @@ ENV/
 env/
 .env
 
-# IDEs
+# IDEs and OS metadata
 .vscode/
 .idea/
+.DS_Store
 *.swp
 *.swo
 *~
@@ -51,6 +52,7 @@ checkpoint-*/
 output*/
 
 .coverage
+htmlcov/
 
 models/
 target/

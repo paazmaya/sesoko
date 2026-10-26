@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Local martial-arts image captions with optional Transformers or MLX backends."""
 
-import argparse
 import hashlib
 import importlib.util
 import json
 import platform
 import sys
-import tempfile
 import time
 import tomllib
 from pathlib import Path
 from typing import Any, cast
 
+import click
 from PIL import Image
 
 from lib.image_utils import (
+    atomic_write,
     get_image_files,
     open_image,
     resize_image_aspect_ratio,
@@ -40,8 +40,15 @@ MODEL_CHOICES: dict[str, Path] = {
     "qwen35-2b": _MODELS_DIR / "Qwen3.5-2B",
 }
 
-# Models that share the Qwen3VL architecture and inference path
-QWEN_MODELS = {"caprl", "qwen3vl", "qwen35-0.8b", "qwen35-2b"}
+MODEL_FINGERPRINT_SUFFIXES = {
+    ".bin",
+    ".jinja",
+    ".json",
+    ".model",
+    ".safetensors",
+    ".tiktoken",
+    ".txt",
+}
 
 DEFAULT_MODEL = "qwen3vl"
 CAPTION_PROMPT = (
@@ -52,6 +59,7 @@ CAPTION_PROMPT = (
 
 
 def load_optional_module(name: str, extra: str) -> Any:
+    """Import an optional dependency module or raise an actionable installation error."""
     try:
         return importlib.import_module(name)
     except ImportError as exc:
@@ -59,6 +67,7 @@ def load_optional_module(name: str, extra: str) -> Any:
 
 
 def resolve_backend(backend: str, model_key: str, device: str = "auto") -> str:
+    """Resolve ``'auto'`` backend to ``'mlx'`` on Apple Silicon when available, else ``'transformers'``."""
     if backend != "auto":
         return backend
     if device in {"cpu", "cuda"}:
@@ -74,6 +83,7 @@ def resolve_backend(backend: str, model_key: str, device: str = "auto") -> str:
 
 
 def resolve_model_path(model_key: str, backend: str, model_path: str | None) -> Path:
+    """Resolve the local directory for ``model_key`` and ``backend`` without downloading."""
     if model_path:
         return Path(model_path).expanduser().resolve()
     mlx_path = _MODELS_DIR / "Qwen3-VL-2B-Instruct-4bit"
@@ -83,6 +93,7 @@ def resolve_model_path(model_key: str, backend: str, model_path: str | None) -> 
 
 
 def configure_pixel_budget(processor: Any, max_pixels: int) -> None:
+    """Constrain a vision processor's maximum pixel budget in place when supported."""
     image_processor = getattr(processor, "image_processor", None)
     if image_processor is None:
         return
@@ -108,7 +119,19 @@ def load_model_and_processor(
     device: str = "auto",
     max_pixels: int = 640 * 640,
 ) -> tuple[Any, Any, str]:
-    """Load local weights only; optional runtimes are imported on demand."""
+    """Load local model weights and processor; optional runtimes are imported on demand.
+
+    Args:
+        model_key: Model identifier from ``MODEL_CHOICES``.
+        quantize: Optional CUDA bitsandbytes quantization mode (``'none'``, ``'int8'``, ``'int4'``).
+        backend: Execution backend (``'auto'``, ``'transformers'``, or ``'mlx'``).
+        model_path: Optional explicit path to a local model checkpoint directory.
+        device: Target compute device (``'auto'``, ``'cpu'``, ``'cuda'``, or ``'mps'``).
+        max_pixels: Maximum pixel budget configured on dynamic-resolution image processors.
+
+    Returns:
+        Tuple of ``(model, processor, effective_device)``.
+    """
     backend = resolve_backend(backend, model_key, device)
     path = resolve_model_path(model_key, backend, model_path)
     if not path.is_dir():
@@ -128,6 +151,7 @@ def load_model_and_processor(
 
 
 def select_torch_device(torch: Any, device: str) -> str:
+    """Select and validate the PyTorch execution device (``'cuda'``, ``'mps'``, or ``'cpu'``)."""
     if device == "auto":
         device = "cpu"
         if torch.cuda.is_available():
@@ -142,12 +166,14 @@ def select_torch_device(torch: Any, device: str) -> str:
 
 
 def torch_dtype(torch: Any, device: str) -> Any:
+    """Return the preferred PyTorch floating-point dtype for ``device``."""
     if device == "cuda":
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return torch.float16 if device == "mps" else torch.float32
 
 
 def quantization_options(model_key: str, device: str, quantize: str, dtype: Any) -> dict[str, Any]:
+    """Build Transformers ``BitsAndBytesConfig`` kwargs when CUDA quantization is requested."""
     if quantize == "none":
         return {}
     if device != "cuda" or model_key == "blip":
@@ -207,19 +233,20 @@ def generate_caption(
     model_key: str = DEFAULT_MODEL,
     max_new_tokens: int = 64,
 ) -> str:
-    """Generate caption for an image.
+    """Generate a single-sentence caption for ``image``.
 
-    Dispatches to the appropriate captioning function based on model type.
+    Dispatches to the appropriate backend and model family.
 
     Args:
-        model: Loaded model (BlipForConditionalGeneration or Qwen3VLForConditionalGeneration)
-        processor: Matching processor
-        image: PIL Image object
-        device: Device to use ("cuda" or "cpu")
-        model_key: Key from MODEL_CHOICES used to select prompt strategy.
+        model: Loaded MLX or Transformers vision-language model.
+        processor: Matching image/text processor.
+        image: RGB PIL Image object.
+        device: Effective execution target (``"cuda"``, ``"mps"``, ``"cpu"``, or ``"mlx"``).
+        model_key: Key from ``MODEL_CHOICES`` used to select prompt strategy.
+        max_new_tokens: Maximum number of tokens to generate.
 
     Returns:
-        Generated caption string
+        Stripped caption string.
     """
     if device == "mlx":
         runtime = load_optional_module("mlx_vlm", "caption-mlx")
@@ -310,24 +337,13 @@ def _generate_caption_qwen3vl(
 
 
 def decode_completion(processor: Any, outputs: Any, input_length: int) -> str:
+    """Decode only the newly generated token slice beyond ``input_length``."""
     generated = [output[input_length:] for output in outputs]
     return processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
 
 
-def atomic_write(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(content)
-        temporary_path.replace(path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
 def image_fingerprint(image_path: Path, settings: dict[str, Any]) -> str:
+    """Compute a SHA-256 cache fingerprint from image stat metadata and active settings."""
     stat = image_path.stat()
     payload: dict[str, Any] = {
         "size": stat.st_size,
@@ -338,140 +354,171 @@ def image_fingerprint(image_path: Path, settings: dict[str, Any]) -> str:
 
 
 def model_fingerprint(path: Path) -> list[list[str | int]]:
+    """Record filenames, byte sizes, and modification times for local model artifacts."""
     return (
         [
             [item.name, item.stat().st_size, item.stat().st_mtime_ns]
             for item in sorted(path.iterdir())
-            if item.is_file() and item.suffix in {".json", ".safetensors", ".jinja", ".txt"}
+            if item.is_file() and item.suffix in MODEL_FINGERPRINT_SUFFIXES
         ]
         if path.is_dir()
         else []
     )
 
 
-def sidecar_path_for(image_path: Path, folder_path: Path, args: Any) -> Path | None:
-    if args.no_sidecar:
+def sidecar_path_for(
+    image_path: Path,
+    folder_path: Path,
+    *,
+    no_sidecar: bool = False,
+    sidecar_dir: str | Path | None = None,
+) -> Path | None:
+    """Return the target `.txt` sidecar path for ``image_path``, or ``None`` when disabled."""
+    if no_sidecar:
         return None
-    if args.sidecar_dir:
+    if sidecar_dir:
         relative = image_path.relative_to(folder_path)
-        return Path(args.sidecar_dir) / relative.with_suffix(relative.suffix + ".txt")
+        return Path(sidecar_dir) / relative.with_suffix(relative.suffix + ".txt")
     return image_path.with_suffix(image_path.suffix + ".txt")
 
 
-def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(
-        description="Caption images using a selectable vision-language model"
-    )
-    parser.add_argument("folder", type=str, help="Path to the folder containing images")
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=str,
-        default="captions.toml",
-        help="Output TOML file path (default: captions.toml)",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        choices=list(MODEL_CHOICES.keys()),
-        default=DEFAULT_MODEL,
-        help=(
-            f"Vision-language model to use for captioning (default: {DEFAULT_MODEL}). "
-            "blip, caprl, qwen3vl, qwen35-0.8b, or qwen35-2b (local weights)"
-        ),
-    )
-    parser.add_argument(
-        "--quantize",
-        type=str,
-        choices=["none", "int8", "int4"],
-        default="none",
-        help=(
-            "Optional CUDA bitsandbytes quantization (default: none). "
-            "Reduces weight memory; speed depends on hardware. Not used with MLX."
-        ),
-    )
-    parser.add_argument(
-        "--no-sidecar",
-        action="store_true",
-        help="Disable creation of sidecar .txt files with captions",
-    )
-    parser.add_argument(
-        "--sidecar-dir",
-        type=str,
-        default=None,
-        help="Directory to write sidecar .txt files (preserves folder structure)",
-    )
-    parser.add_argument("--backend", choices=["auto", "transformers", "mlx"], default="auto")
-    parser.add_argument(
-        "--model-path", help="Local compatible model directory; no implicit downloads"
-    )
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
-    parser.add_argument(
-        "--image-size", type=int, default=640, help="Caption preview longest edge (default: 640)"
-    )
-    parser.add_argument(
-        "--max-pixels", type=int, help="Processor pixel budget (default: image-size squared)"
-    )
-    parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument(
-        "--overwrite", action="store_true", help="Regenerate even unchanged captions"
-    )
-
-    args = parser.parse_args()
-    if args.image_size < 32 or args.max_new_tokens < 1:
-        parser.error("--image-size must be at least 32; --max-new-tokens must be positive")
-    args.max_pixels = args.max_pixels if args.max_pixels is not None else args.image_size**2
-    if args.max_pixels < 32 * 32:
-        parser.error("--max-pixels must be at least 1024")
+@click.command()
+@click.argument("folder", type=str)
+@click.option(
+    "-o",
+    "--output",
+    type=str,
+    default="captions.toml",
+    show_default=True,
+    help="Output TOML file path",
+)
+@click.option(
+    "--model",
+    "model_key",
+    type=click.Choice(list(MODEL_CHOICES.keys())),
+    default=DEFAULT_MODEL,
+    show_default=True,
+    help="Vision-language model to use for captioning (local weights)",
+)
+@click.option(
+    "--quantize",
+    type=click.Choice(["none", "int8", "int4"]),
+    default="none",
+    show_default=True,
+    help="Optional CUDA bitsandbytes quantization (not used with MLX)",
+)
+@click.option(
+    "--no-sidecar",
+    is_flag=True,
+    help="Disable creation of sidecar .txt files with captions",
+)
+@click.option(
+    "--sidecar-dir",
+    type=str,
+    default=None,
+    help="Directory to write sidecar .txt files (preserves folder structure)",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["auto", "transformers", "mlx"]),
+    default="auto",
+    show_default=True,
+)
+@click.option(
+    "--model-path",
+    type=str,
+    default=None,
+    help="Local compatible model directory; no implicit downloads",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["auto", "cpu", "cuda", "mps"]),
+    default="auto",
+    show_default=True,
+)
+@click.option(
+    "--image-size",
+    type=int,
+    default=640,
+    show_default=True,
+    help="Caption preview longest edge",
+)
+@click.option(
+    "--max-pixels",
+    type=int,
+    default=None,
+    help="Processor pixel budget (default: image-size squared)",
+)
+@click.option("--max-new-tokens", type=int, default=64, show_default=True)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    help="Regenerate even unchanged captions",
+)
+def main(
+    folder: str,
+    output: str,
+    model_key: str,
+    quantize: str,
+    no_sidecar: bool,
+    sidecar_dir: str | None,
+    backend: str,
+    model_path: str | None,
+    device: str,
+    image_size: int,
+    max_pixels: int | None,
+    max_new_tokens: int,
+    overwrite: bool,
+) -> None:
+    """Caption images recursively using a local vision-language model."""
+    if image_size < 32 or max_new_tokens < 1:
+        raise click.UsageError(
+            "--image-size must be at least 32; --max-new-tokens must be positive"
+        )
+    effective_max_pixels = max_pixels if max_pixels is not None else image_size**2
+    if effective_max_pixels < 32 * 32:
+        raise click.UsageError("--max-pixels must be at least 1024")
     if tomli_w is None:
-        parser.error("TOML output requires tomli-w; install a caption extra")
-    args.backend = resolve_backend(args.backend, args.model, args.device)
-    model_path = resolve_model_path(args.model, args.backend, args.model_path)
+        raise click.UsageError("TOML output requires tomli-w; install a caption extra")
+    resolved_backend = resolve_backend(backend, model_key, device)
+    resolved_model_path = resolve_model_path(model_key, resolved_backend, model_path)
 
-    # Validate folder
-    folder_path = Path(args.folder)
+    folder_path = Path(folder)
     if not folder_path.is_dir():
-        print(f"Error: {args.folder} is not a valid directory", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(f"{folder} is not a valid directory")
 
-    # Get image files
     image_files = get_image_files(folder_path)
     if not image_files:
-        print(f"No image files found in {args.folder}", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(f"No image files found in {folder}")
 
     print(f"Found {len(image_files)} image(s) to process")
 
-    # Determine output path and format
-    output_path = Path(args.output)
+    output_path = Path(output)
     if output_path.suffix.lower() != ".toml":
         output_path = output_path.with_suffix(".toml")
 
     print(f"Captions will be saved to {output_path}")
-    if not args.no_sidecar:
-        if args.sidecar_dir:
-            print(f"Sidecar .txt files will be created in {args.sidecar_dir}")
+    if not no_sidecar:
+        if sidecar_dir:
+            print(f"Sidecar .txt files will be created in {sidecar_dir}")
         else:
             print("Sidecar .txt files will also be created alongside images")
 
-    # Process images and generate captions with streaming writes
-    # Get absolute path of the input folder to use as section name
     absolute_folder_path = folder_path.resolve().as_posix()
 
-    # Load existing captions if the file exists
     if output_path.exists():
         try:
             with open(output_path, "rb") as f:
                 captions: dict[str, Any] = tomllib.load(f)
         except (OSError, ValueError) as exc:
-            parser.error(f"Cannot read existing captions; refusing to overwrite: {exc}")
+            raise click.UsageError(
+                f"Cannot read existing captions; refusing to overwrite: {exc}"
+            ) from exc
     else:
         captions = {}
 
-    # Only create the section if it doesn't already exist
     if absolute_folder_path in captions and not isinstance(captions[absolute_folder_path], dict):
-        parser.error("Existing caption folder section must be a TOML table")
+        raise click.UsageError("Existing caption folder section must be a TOML table")
     if absolute_folder_path not in captions:
         captions[absolute_folder_path] = {}
 
@@ -486,14 +533,15 @@ def main():
     if not isinstance(metadata.get(absolute_folder_path), dict):
         metadata[absolute_folder_path] = {}
     settings: dict[str, Any] = {
-        "model": str(model_path.resolve()),
-        "model_files": model_fingerprint(model_path),
-        "backend": args.backend,
-        "device": args.device,
-        "quantize": args.quantize,
-        "image_size": args.image_size,
-        "max_pixels": args.max_pixels,
-        "max_new_tokens": args.max_new_tokens,
+        "model_key": model_key,
+        "model": str(resolved_model_path.resolve()),
+        "model_files": model_fingerprint(resolved_model_path),
+        "backend": resolved_backend,
+        "device": device,
+        "quantize": quantize,
+        "image_size": image_size,
+        "max_pixels": effective_max_pixels,
+        "max_new_tokens": max_new_tokens,
         "prompt": CAPTION_PROMPT,
         "pipeline_version": 1,
     }
@@ -503,12 +551,14 @@ def main():
         fingerprint = image_fingerprint(image_path, settings)
         caption = captions[absolute_folder_path].get(relative_path)
         if (
-            not args.overwrite
+            not overwrite
             and isinstance(caption, str)
             and caption.strip()
             and metadata[absolute_folder_path].get(relative_path) == fingerprint
         ):
-            sidecar = sidecar_path_for(image_path, folder_path, args)
+            sidecar = sidecar_path_for(
+                image_path, folder_path, no_sidecar=no_sidecar, sidecar_dir=sidecar_dir
+            )
             if sidecar is not None and not sidecar.exists():
                 atomic_write(sidecar, caption.encode("utf-8"))
             continue
@@ -517,20 +567,20 @@ def main():
     if not pending:
         print("Captions are up to date; no model loaded")
         return
-    model, processor, device = load_model_and_processor(
-        args.model,
-        args.quantize,
-        backend=args.backend,
-        model_path=str(model_path),
-        device=args.device,
-        max_pixels=args.max_pixels,
-    )
+    try:
+        loaded_model, processor, active_device = load_model_and_processor(
+            model_key,
+            quantize,
+            backend=resolved_backend,
+            model_path=str(resolved_model_path),
+            device=device,
+            max_pixels=effective_max_pixels,
+        )
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
-    # Prepare sidecar directory if specified
-    sidecar_base_dir = None
-    if not args.no_sidecar and args.sidecar_dir:
-        sidecar_base_dir = Path(args.sidecar_dir)
-        sidecar_base_dir.mkdir(parents=True, exist_ok=True)
+    if not no_sidecar and sidecar_dir:
+        Path(sidecar_dir).mkdir(parents=True, exist_ok=True)
 
     failures = 0
     for idx, (image_path, fingerprint) in enumerate(pending, 1):
@@ -542,43 +592,26 @@ def main():
                 flush=True,
             )
 
-            # Load and resize image
             image = open_image(image_path)
-            image = resize_image_aspect_ratio(
-                image, target_size=args.image_size, allow_upscale=False
-            )
+            image = resize_image_aspect_ratio(image, target_size=image_size, allow_upscale=False)
 
-            # Generate caption
             caption = generate_caption(
-                model, processor, image, device, args.model, args.max_new_tokens
+                loaded_model, processor, image, active_device, model_key, max_new_tokens
             )
             if not caption.strip():
                 raise ValueError("Model returned an empty caption")
 
-            # Store with relative path as key under the folder section
             relative_path = image_path.relative_to(folder_path).as_posix()
             captions[absolute_folder_path][relative_path] = caption
 
-            # Show caption
             print(f"✓ {caption} ({time.perf_counter() - started:.2f}s)")
 
-            # Stream write to TOML file immediately
             atomic_write(output_path, tomli_w.dumps(captions).encode("utf-8"))
 
-            # Write sidecar .txt file if not disabled
-            if not args.no_sidecar:
-                if sidecar_base_dir:
-                    # Write to sidecar directory, preserving folder structure
-                    relative_path_obj = image_path.relative_to(folder_path)
-                    sidecar_path = sidecar_base_dir / relative_path_obj.with_suffix(
-                        relative_path_obj.suffix + ".txt"
-                    )
-                    # Create subdirectories if needed
-                    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    # Write alongside image
-                    sidecar_path = image_path.with_suffix(image_path.suffix + ".txt")
-
+            sidecar_path = sidecar_path_for(
+                image_path, folder_path, no_sidecar=no_sidecar, sidecar_dir=sidecar_dir
+            )
+            if sidecar_path is not None:
                 try:
                     atomic_write(sidecar_path, caption.encode("utf-8"))
                 except PermissionError:
@@ -592,7 +625,7 @@ def main():
                     print(
                         "Use --no-sidecar flag to process without sidecar files.", file=sys.stderr
                     )
-                    if not args.sidecar_dir:
+                    if not sidecar_dir:
                         print(
                             "Or use --sidecar-dir to write sidecar files to a different location.",
                             file=sys.stderr,

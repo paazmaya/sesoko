@@ -4,8 +4,13 @@ version = "0.1.0"
 description = "Exact-size image preparation and local martial-arts captioning for ML training"
 readme = "README.md"
 license = "MIT"
+authors = [{ name = "Juga Paazmaya", email = "paazmaya@yahoo.com" }]
 requires-python = ">=3.13"
 dependencies = ["pillow>=12.1.0", "click>=8.3.1"]
+
+[project.urls]
+Homepage = "https://github.com/paazmaya/sesoko"
+Repository = "https://github.com/paazmaya/sesoko"
 
 [project.scripts]
 sesoko-crop = "crop_yolo:main"

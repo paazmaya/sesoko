@@ -2,6 +2,8 @@
 
 > Prepare images for training machine learning models
 
+[![Lightweight Tests](https://github.com/paazmaya/sesoko/actions/workflows/test.yml/badge.svg)](https://github.com/paazmaya/sesoko/actions/workflows/test.yml)
+
 Prepare exact-size images with optional person-centered crops and local martial-arts captions.
 Python 3.13+ is required. Basic preparation needs only Pillow and Click; no GPU or ML runtime.
 

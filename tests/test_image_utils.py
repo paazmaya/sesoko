@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from lib.image_utils import (
+    atomic_write,
     crop_to_square,
     get_image_files,
     open_image,
@@ -47,6 +48,22 @@ def temp_image_dir() -> Iterator[Path]:
         rgba_img.save(temp_path / "rgba.png")
 
         yield temp_path
+
+
+class TestAtomicWrite:
+    """Tests for atomic_write function."""
+
+    def test_atomic_write_creates_file(self, tmp_path: Path):
+        dest = tmp_path / "subdir" / "test.txt"
+        atomic_write(dest, b"hello world")
+        assert dest.exists()
+        assert dest.read_bytes() == b"hello world"
+
+    def test_atomic_write_overwrites_cleanly(self, tmp_path: Path):
+        dest = tmp_path / "overwrite.txt"
+        atomic_write(dest, b"initial")
+        atomic_write(dest, b"updated")
+        assert dest.read_bytes() == b"updated"
 
 
 class TestGetImageFiles:
@@ -191,6 +208,13 @@ class TestResizeImageAspectRatio:
         image = Image.new("RGB", (1000, 1))
         assert resize_image_aspect_ratio(image, 32).size == (32, 1)
 
+    def test_negative_or_zero_target_size_raises(self):
+        image = Image.new("RGB", (100, 100))
+        with pytest.raises(ValueError, match="Target size must be positive"):
+            resize_image_aspect_ratio(image, 0)
+        with pytest.raises(ValueError, match="Target size must be positive"):
+            resize_image_aspect_ratio(image, -10)
+
 
 class TestCropToSquare:
     """Tests for crop_to_square function."""
@@ -267,11 +291,23 @@ class TestPrepareCrop:
         assert result.size == (200, 100)
         assert sum(pixel == (255, 0, 0) for pixel in result.get_flattened_data()) == 80 * 100
 
+    def test_prepare_crop_with_crop_height_larger_than_image(self):
+        image = Image.new("RGB", (100, 50), "red")
+        result = prepare_crop(image, (50, 100), (0, 0, 100, 50), margin=0.5)
+        assert result.size == (50, 100)
+
     @pytest.mark.parametrize("size", [(0, 512), (512, -1)])
     def test_invalid_output_size(self, size: tuple[int, int]):
         image = Image.new("RGB", (10, 10))
         with pytest.raises(ValueError, match="positive"):
             prepare_crop(image, size)
+
+    def test_invalid_margin(self):
+        image = Image.new("RGB", (10, 10))
+        with pytest.raises(ValueError, match="Margin must be finite and nonnegative"):
+            prepare_crop(image, (10, 10), margin=-0.1)
+        with pytest.raises(ValueError, match="Margin must be finite and nonnegative"):
+            prepare_crop(image, (10, 10), margin=float("inf"))
 
     @pytest.mark.parametrize("box", [(5, 5, 4, 9), (20, 20, 30, 30), (0, 0, float("nan"), 2)])
     def test_invalid_subject_box(self, box: tuple[float, float, float, float]):
@@ -345,6 +381,15 @@ class TestSaveImageOptimized:
                 pixel = loaded.getpixel((10, 10))
                 assert isinstance(pixel, tuple)
                 assert all(channel > 250 for channel in pixel)
+
+    def test_invalid_format_or_quality_raises(self, tmp_path: Path):
+        img = Image.new("RGB", (20, 20))
+        with pytest.raises(ValueError, match="Expected jpeg/png/webp"):
+            save_image_optimized(img, tmp_path / "out.gif", output_format="gif")
+        with pytest.raises(ValueError, match="Expected jpeg/png/webp"):
+            save_image_optimized(img, tmp_path / "out.jpg", quality=0)
+        with pytest.raises(ValueError, match="Expected jpeg/png/webp"):
+            save_image_optimized(img, tmp_path / "out.jpg", quality=101)
 
 
 class TestImageIntegration:
